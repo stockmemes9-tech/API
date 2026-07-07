@@ -1,0 +1,1 @@
+worker: python coinswitch_resistance_short_bot.py
