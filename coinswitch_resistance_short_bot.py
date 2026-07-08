@@ -261,16 +261,20 @@ def get_klines(symbol, interval=KLINE_INTERVAL, limit=RESISTANCE_LOOKBACK_CANDLE
     r.raise_for_status()  # exhausted retries, surface the last error
 
 
-def get_positions(symbol):
+def get_positions(symbol, max_retries=3, retry_delay_seconds=2.0):
     """Returns the list of currently OPEN positions for a symbol (empty list if
     none). Closed positions simply disappear from this endpoint — there's no
     terminal 'CLOSED' status to check for."""
     headers, path = sign_request(
         "GET", "/trade/api/v2/futures/positions", {"exchange": EXCHANGE, "symbol": symbol}
     )
-    r = requests.get(BASE_URL + path, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()["data"]
+    for attempt in range(max_retries + 1):
+        r = requests.get(BASE_URL + path, headers=headers, timeout=15)
+        if r.status_code == 429 and attempt < max_retries:
+            time.sleep(retry_delay_seconds * (2 ** attempt))
+            continue
+        r.raise_for_status()
+        return r.json()["data"]
 
 
 def get_realized_pnl(symbol, from_time_ms):
@@ -483,6 +487,70 @@ def set_leverage(symbol, leverage):
     return r.json()
 
 
+# ------------------------------ Startup recovery --------------------------------
+#
+# Runs once, before the scan loop starts. Without this, open_shorts always
+# starts empty on a restart (crash, redeploy, manual stop) — meaning a real
+# still-open position from before the restart would go untracked, and the
+# bot could open a second position on the same symbol without realizing one
+# already exists. This is a READ-ONLY call (no orders placed), so it's safe
+# to run regardless of DRY_RUN — right now, with DRY_RUN=true and the bot
+# never having placed a real order, it should simply find nothing.
+
+def recover_open_positions(instruments):
+    symbols = list(instruments.keys())
+    print(f"Checking {len(symbols)} symbols on CoinSwitch for pre-existing open positions...")
+    recovered = {}
+    for i, symbol in enumerate(symbols):
+        try:
+            positions = get_positions(symbol)
+        except requests.HTTPError as e:
+            print(f"  [recover] {symbol}: position check failed ({e}), skipping. "
+                  f"If this symbol genuinely has an open position, it won't be tracked "
+                  f"until a future restart succeeds in checking it.")
+            continue
+
+        if positions:
+            p = positions[0]
+            entry_price = None
+            for key in ("entry_price", "avg_price", "average_price"):
+                try:
+                    entry_price = float(p[key])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    continue
+            qty = None
+            for key in ("quantity", "size", "position_amount", "qty"):
+                try:
+                    qty = float(p[key])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+            recovered[symbol] = {
+                "entry_price": entry_price,   # may be None if the field name didn't match — logged below either way
+                "qty": qty,
+                "tp_price": None,             # unknown for a recovered position; irrelevant for real (non-simulated)
+                                               # positions since those are closed-checked against the live API, not this.
+                "opened_at_ms": int(time.time() * 1000),  # true entry time unknown; P&L accounting starts from now
+                "simulated": False,           # always a real exchange position, regardless of today's DRY_RUN setting
+            }
+            print(f"  [recover] {symbol}: found an existing open position — now tracked. Raw: {p}")
+
+        if (i + 1) % 10 == 0:
+            time.sleep(1)  # light pacing across a few hundred symbols to avoid 429s
+
+    if recovered:
+        print(f"Recovered {len(recovered)} pre-existing open position(s): {', '.join(recovered.keys())}")
+        send_telegram_message(
+            f"Startup: recovered {len(recovered)} pre-existing open position(s) from CoinSwitch: "
+            f"{', '.join(recovered.keys())}"
+        )
+    else:
+        print("  [recover] no pre-existing open positions found.")
+    return recovered
+
+
 # ------------------------------ Position reconciliation --------------------------
 #
 # THE BUG THAT CAUSED THE FREEZE: the old version only ever added symbols to
@@ -496,7 +564,13 @@ def set_leverage(symbol, leverage):
 def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
     closed = []
     for symbol, pos in list(open_shorts.items()):
-        if DRY_RUN:
+        # Per-position flag, not the global DRY_RUN — a position recovered
+        # from the real account at startup (or opened while DRY_RUN was
+        # previously false) is always real and must be closed-checked
+        # against the live API, even if the bot is running in DRY_RUN today.
+        is_simulated = pos.get("simulated", DRY_RUN)
+
+        if is_simulated:
             # No real order was placed, so there's no real position to poll.
             # We simulate the only exit this bot ever places — the take-profit
             # limit — by checking whether the live price has reached it.
@@ -509,7 +583,7 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
                 last_price = float(t["last_price"])
             except (KeyError, ValueError):
                 continue
-            if last_price <= pos["tp_price"]:
+            if pos["tp_price"] is not None and last_price <= pos["tp_price"]:
                 pnl = (pos["entry_price"] - pos["tp_price"]) * pos["qty"]
                 closed.append((symbol, pnl))
         else:
@@ -680,6 +754,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             "qty": qty,
             "tp_price": tp_price,
             "opened_at_ms": opened_at_ms,
+            "simulated": DRY_RUN,
         }
 
 
@@ -694,7 +769,10 @@ def main():
     print("Fetching CoinSwitch futures instrument info...")
     instruments = fetch_with_retry(get_instrument_info, description="CoinSwitch instrument info")
 
-    open_shorts = {}  # symbol -> {entry_price, qty, tp_price, opened_at_ms}; in-memory, resets on restart
+    open_shorts = fetch_with_retry(
+        recover_open_positions, instruments, description="recovering open positions from CoinSwitch"
+    )  # symbol -> {entry_price, qty, tp_price, opened_at_ms, simulated}; rebuilt from the real
+       # account on every startup so a restart can't silently forget a still-open position.
     daily_trade_tracker = {
         "date": today_ist(),
         "count": 0,               # trades opened today
