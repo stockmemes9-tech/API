@@ -302,16 +302,24 @@ def get_positions(symbol, max_retries=3, retry_delay_seconds=2.0):
         r.raise_for_status()
         body = r.json()
         if "data" not in body:
-            # CoinSwitch returned 200 OK (raise_for_status didn't catch this)
-            # but the body doesn't have the shape we expect — e.g. an error
-            # wrapped as {"message": ...} without a "data" key, on some
-            # symbols. Print the raw body so this is diagnosable from logs
-            # instead of surfacing as an opaque KeyError('data'), and raise
-            # something the caller can catch alongside HTTPError so ONE bad
-            # symbol doesn't abort the whole recovery scan.
+            # Confirmed from real CoinSwitch responses: when a symbol has no
+            # open positions, this endpoint returns HTTP 200 with
+            # {"message": "There are no open Positions"} instead of
+            # {"data": []}. That's the expected, common-case response for
+            # most symbols (most won't have a position open) — not an error —
+            # so treat it as an empty position list rather than logging every
+            # single no-position symbol as a "failure" during recovery.
+            message = str(body.get("message", "")).lower()
+            if "no open position" in message:
+                return []
+            # Anything else without a "data" field genuinely is unexpected —
+            # print the raw body so it's diagnosable from logs instead of
+            # surfacing as an opaque KeyError('data'), and raise something
+            # the caller can catch alongside HTTPError so ONE bad symbol
+            # doesn't abort the whole recovery scan.
             raise RuntimeError(
-                f"CoinSwitch /positions response for {symbol} has no 'data' field. "
-                f"HTTP {r.status_code}, raw body: {body}"
+                f"CoinSwitch /positions response for {symbol} has no 'data' field and isn't "
+                f"the known 'no open positions' message. HTTP {r.status_code}, raw body: {body}"
             )
         return body["data"]
 
