@@ -464,6 +464,12 @@ def resolve_leverage(instrument, desired=DESIRED_LEVERAGE):
     except (TypeError, ValueError):
         step = 1
 
+    # NOTE: if a symbol's own min_leverage is above `desired`, this can return
+    # MORE leverage than requested (forcing it back down to `desired` would
+    # just make set_leverage() get rejected — you can't run below a symbol's
+    # own floor). This is the opposite of the usual "fall back to what's
+    # available" case, so the caller must check both directions, not just
+    # "leverage < desired", or this ships with silently higher risk.
     effective = max(min(desired, max_lev), min_lev)
     if step > 0:
         # snap down to the nearest valid step at/above the symbol's minimum
@@ -511,16 +517,31 @@ def recover_open_positions(instruments):
             continue
 
         if positions:
+            # CoinSwitch's real /futures/positions schema (per official docs):
+            # entry price -> "avg_entry_price", size -> "position_size",
+            # direction -> "position_side" ("LONG"/"SHORT"). The old field-name
+            # guessing here never matched those, so entry_price/qty were always
+            # None. Also skip anything that isn't actually a SHORT — this bot
+            # never opens longs, so a LONG on a symbol is either a manual
+            # position or leftover from something else, and treating it as one
+            # of ours would permanently block shorting that symbol and corrupt
+            # P&L math whenever it's "closed".
             p = positions[0]
+            if p.get("position_side") not in (None, "SHORT"):
+                print(f"  [recover] {symbol}: open position is {p.get('position_side')}, "
+                      f"not SHORT — not tracking it as one of this bot's trades. Raw: {p}")
+                time.sleep(3.1)
+                continue
+
             entry_price = None
-            for key in ("entry_price", "avg_price", "average_price"):
+            for key in ("avg_entry_price", "entry_price", "avg_price", "average_price"):
                 try:
                     entry_price = float(p[key])
                     break
                 except (KeyError, ValueError, TypeError):
                     continue
             qty = None
-            for key in ("quantity", "size", "position_amount", "qty"):
+            for key in ("position_size", "quantity", "size", "position_amount", "qty"):
                 try:
                     qty = float(p[key])
                     break
@@ -537,8 +558,10 @@ def recover_open_positions(instruments):
             }
             print(f"  [recover] {symbol}: found an existing open position — now tracked. Raw: {p}")
 
-        if (i + 1) % 10 == 0:
-            time.sleep(1)  # light pacing across a few hundred symbols to avoid 429s
+        time.sleep(3.1)  # Get Positions is rate-limited to 20 req/60s per CoinSwitch's
+                          # docs (~1 every 3s); the old 1s-per-10-calls pacing was
+                          # 5-10x over that budget and would 429-storm on startup
+                          # across a few hundred symbols.
 
     if recovered:
         print(f"Recovered {len(recovered)} pre-existing open position(s): {', '.join(recovered.keys())}")
@@ -686,7 +709,9 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             print("  Max concurrent shorts reached, skipping further entries this cycle.")
             break
 
-        time.sleep(0.5)  # small pacing delay between klines calls to avoid 429 rate limiting
+        time.sleep(2.1)  # KLines is rate-limited to 30 req/60s per CoinSwitch's docs
+                          # (~1 every 2s); 0.5s was ~4x over that budget and would
+                          # 429-storm on scan cycles with several candidates.
 
         try:
             resistance = evaluate_resistance(symbol, cand["last_price"])
@@ -714,6 +739,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         leverage = resolve_leverage(instrument)
         if leverage < DESIRED_LEVERAGE:
             print(f"      {symbol}: {DESIRED_LEVERAGE}x not available, using max {leverage}x instead.")
+        elif leverage > DESIRED_LEVERAGE:
+            print(f"      {symbol}: this symbol's own minimum leverage ({leverage}x) is above "
+                  f"{DESIRED_LEVERAGE}x — trading at {leverage}x instead, which is MORE leverage "
+                  f"than desired. Consider skipping this symbol if that's not acceptable.")
         set_leverage(symbol, leverage)
 
         qty = compute_quantity(cand["last_price"], order_margin_usdt, leverage, instrument)
@@ -724,11 +753,32 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         print(f"      order response: {resp['data']}")
         daily_trade_tracker["count"] += 1
 
+        # Size everything downstream off what actually filled, not what we asked
+        # for. Futures MARKET orders can PARTIALLY_EXECUTE with no auto-retry of
+        # the remainder — and this strategy specifically targets non-top-100,
+        # lower-liquidity coins, so partial fills are a real possibility, not an
+        # edge case. Using the requested qty here for the reduce-only TP order
+        # (or for P&L bookkeeping) would size it against a position that doesn't
+        # actually exist at that size.
+        try:
+            filled_qty = float(resp["data"].get("exec_quantity", qty))
+        except (TypeError, ValueError):
+            filled_qty = qty
+        if filled_qty <= 0:
+            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
+                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            continue
+        if filled_qty != qty:
+            print(f"      {symbol}: requested {qty}, filled {filled_qty} "
+                  f"(partial fill) — sizing take-profit off the filled amount.")
+        qty = filled_qty
+
         entry_msg = (
             f"{'[DRY RUN] ' if DRY_RUN else ''}SHORT {symbol}\n"
             f"Entry: {cand['last_price']} (market)\n"
             f"Qty: {qty}  |  Leverage: {leverage}x"
-            f"{' (capped, 5x unavailable)' if leverage < DESIRED_LEVERAGE else ''}\n"
+            f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
+            f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
             f"24h: {cand['pct_change_24h']:.2f}%  |  Resistance: ~{resistance:.6g}\n"
             f"No stop-loss set on this position."
         )
