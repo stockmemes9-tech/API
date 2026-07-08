@@ -154,6 +154,13 @@ MAX_TRADES_PER_DAY = 10               # hard cap on new entries per calendar day
 
 POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
 
+# --- Position monitoring ---
+STATUS_UPDATE_INTERVAL_SECONDS = 15 * 60   # send an open-positions P&L snapshot to Telegram this often
+LIQUIDATION_WARNING_PCT = 50.0             # alert once a position's adverse move has covered this
+                                            # % of the distance from entry to its estimated liquidation
+                                            # price (see estimate_liquidation_price() for the caveats
+                                            # on how that estimate is derived).
+
 # --- Telegram notifications ---
 # 1. Message @BotFather on Telegram, send /newbot, follow the prompts -> you get a bot token.
 # 2. Start a chat with your new bot (search its username, send it any message).
@@ -594,6 +601,12 @@ def recover_open_positions(instruments, daily_trade_tracker):
     recovered = {
         symbol: pos for symbol, pos in state_open_shorts.items() if pos.get("simulated")
     }
+    for pos in recovered.values():
+        # Backfill defaults for keys that didn't exist in state files saved
+        # before liquidation monitoring was added, so older saved state
+        # doesn't crash check_liquidation_warnings()/send_position_status_update().
+        pos.setdefault("leverage", DESIRED_LEVERAGE)
+        pos.setdefault("liquidation_warning_sent", False)
     if recovered:
         print(f"  [state] restored {len(recovered)} simulated (DRY RUN) open short(s) "
               f"from saved state: {', '.join(recovered.keys())}")
@@ -650,9 +663,32 @@ def recover_open_positions(instruments, daily_trade_tracker):
             if saved and not saved.get("simulated"):
                 tp_price = saved.get("tp_price")
                 opened_at_ms = saved.get("opened_at_ms", int(time.time() * 1000))
+                liquidation_warning_sent = saved.get("liquidation_warning_sent", False)
             else:
                 tp_price = None
                 opened_at_ms = int(time.time() * 1000)  # true entry time unknown otherwise
+                liquidation_warning_sent = False
+
+            # Leverage actually set on the exchange for a position opened
+            # before this restart isn't returned consistently by every
+            # CoinSwitch response shape, so try the position payload first,
+            # then fall back to whatever we had saved for this symbol, and
+            # only then to DESIRED_LEVERAGE as a last resort. A wrong
+            # fallback here only affects the liquidation-distance ESTIMATE
+            # (see estimate_liquidation_price()) — it never changes what
+            # order gets placed, since no new order is placed on recovery.
+            leverage = None
+            for key in ("leverage", "leverage_multiplier", "position_leverage"):
+                try:
+                    leverage = float(p[key])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if leverage is None:
+                leverage = (saved.get("leverage") if saved else None) or DESIRED_LEVERAGE
+                print(f"      {symbol}: exchange didn't report leverage on this recovered "
+                      f"position, using {leverage}x for the liquidation estimate (may be wrong "
+                      f"if the real leverage set on this position differs).")
 
             recovered[symbol] = {
                 "entry_price": entry_price,   # may be None if the field name didn't match — logged below either way
@@ -660,6 +696,8 @@ def recover_open_positions(instruments, daily_trade_tracker):
                 "tp_price": tp_price,
                 "opened_at_ms": opened_at_ms,
                 "simulated": False,           # always a real exchange position, regardless of today's DRY_RUN setting
+                "leverage": leverage,
+                "liquidation_warning_sent": liquidation_warning_sent,
             }
             print(f"  [recover] {symbol}: found an existing open position — now tracked. Raw: {p}")
 
@@ -770,6 +808,123 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
         save_state(open_shorts, daily_trade_tracker)
 
 
+# ------------------------------ Position monitoring ------------------------------
+
+def estimate_liquidation_price(entry_price, leverage):
+    """Rough isolated-margin liquidation price estimate for a SHORT position,
+    ignoring maintenance margin rate, funding, and fees — none of which this
+    script fetches from CoinSwitch. A short's margin (entry_price*qty/leverage)
+    is fully wiped once price has risen by entry_price/leverage, so:
+
+        liq_price ~= entry_price * (1 + 1/leverage)
+
+    In reality the exchange liquidates earlier than this once losses eat into
+    the maintenance margin buffer, so treat this as an optimistic upper bound
+    on how much room the position actually has — the real liquidation price
+    is always somewhat below (i.e. closer, in adverse-move terms) this
+    estimate. Good enough for an early-warning Telegram alert; not something
+    to rely on for precise risk sizing."""
+    if not leverage or leverage <= 0:
+        return None
+    return entry_price * (1 + 1.0 / leverage)
+
+
+def check_liquidation_warnings(open_shorts, tickers):
+    """Sends a one-time Telegram alert per position the first cycle its
+    adverse move covers LIQUIDATION_WARNING_PCT of the distance from entry to
+    its estimated liquidation price (see estimate_liquidation_price() for the
+    caveats on that estimate). Re-arms itself (resets the flag) if price
+    later moves back below the threshold, so a position that pokes across the
+    line, retreats, and crosses again later gets alerted both times rather
+    than going silent for the rest of its life."""
+    changed = False
+    for symbol, pos in open_shorts.items():
+        entry_price = pos.get("entry_price")
+        leverage = pos.get("leverage")
+        if entry_price is None or leverage is None:
+            continue  # can't estimate without both — e.g. a recovered position with an unmatched entry_price field
+
+        t = tickers.get(symbol)
+        if t is None:
+            continue
+        try:
+            current_price = float(t["last_price"])
+        except (KeyError, ValueError):
+            continue
+
+        liq_price = estimate_liquidation_price(entry_price, leverage)
+        if liq_price is None or liq_price <= entry_price:
+            continue
+        distance_covered_pct = (current_price - entry_price) / (liq_price - entry_price) * 100
+
+        already_sent = pos.get("liquidation_warning_sent", False)
+        if distance_covered_pct >= LIQUIDATION_WARNING_PCT:
+            if not already_sent:
+                print(f"  [liquidation] {symbol}: {distance_covered_pct:.0f}% of the way to "
+                      f"estimated liquidation ({liq_price:.6g}) — sending warning.")
+                send_telegram_message(
+                    f"⚠️ {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} short is "
+                    f"~{distance_covered_pct:.0f}% of the way to its estimated liquidation price.\n"
+                    f"Entry: {entry_price}  |  Current: {current_price}  |  Leverage: {leverage}x\n"
+                    f"Est. liquidation: ~{liq_price:.6g} (rough estimate — ignores maintenance "
+                    f"margin, so the real liquidation price is likely somewhat closer than this)."
+                )
+                pos["liquidation_warning_sent"] = True
+                changed = True
+        elif already_sent:
+            # Price recovered back below the threshold — re-arm so a future
+            # crossing alerts again instead of staying permanently silenced.
+            pos["liquidation_warning_sent"] = False
+            changed = True
+    return changed
+
+
+def send_position_status_update(open_shorts, tickers):
+    """Periodic (STATUS_UPDATE_INTERVAL_SECONDS) Telegram snapshot of every
+    open position's current unrealized P&L. Skips sending entirely when
+    nothing is open, so it doesn't spam an empty message every 15 minutes."""
+    if not open_shorts:
+        return
+
+    lines = []
+    total_unrealized = 0.0
+    priced_count = 0
+    for symbol, pos in open_shorts.items():
+        entry_price = pos.get("entry_price")
+        qty = pos.get("qty")
+        t = tickers.get(symbol)
+        if entry_price is None or qty is None or t is None:
+            lines.append(f"{symbol}: price/qty unavailable this cycle")
+            continue
+        try:
+            current_price = float(t["last_price"])
+        except (KeyError, ValueError):
+            lines.append(f"{symbol}: current price unavailable this cycle")
+            continue
+
+        # SHORT: profit when price has fallen below entry.
+        unrealized = (entry_price - current_price) * qty
+        pct_move = (entry_price - current_price) / entry_price * 100
+        emoji = "🟢" if unrealized > 0 else ("🔴" if unrealized < 0 else "⚪")
+        total_unrealized += unrealized
+        priced_count += 1
+        lines.append(
+            f"{emoji} {symbol}{' [DRY RUN]' if pos.get('simulated') else ''}: "
+            f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
+            f"entry {entry_price} -> now {current_price}"
+        )
+
+    header_emoji = "🟢" if total_unrealized > 0 else ("🔴" if total_unrealized < 0 else "⚪")
+    msg = (
+        f"{header_emoji} Open positions status ({priced_count}/{len(open_shorts)} priced)\n"
+        + "\n".join(lines)
+    )
+    if priced_count:
+        msg += f"\nTotal unrealized P&L: {total_unrealized:+.2f} USDT"
+    print(f"\n[status update] {msg}")
+    send_telegram_message(msg)
+
+
 def send_daily_summary(daily_trade_tracker, open_shorts):
     pnl = daily_trade_tracker["realized_pnl_usdt"]
     emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
@@ -788,9 +943,20 @@ def send_daily_summary(daily_trade_tracker, open_shorts):
 # ------------------------------ Main loop ---------------------------------------
 
 def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
-             last_market_refresh_date):
+             last_market_refresh_date, last_status_update_ms):
     tickers = get_all_tickers()
     reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
+
+    # Liquidation-distance check runs every cycle (not on the 15-minute
+    # status timer) since an adverse move can cross the warning threshold
+    # well before the next scheduled status update.
+    if check_liquidation_warnings(open_shorts, tickers):
+        save_state(open_shorts, daily_trade_tracker)
+
+    now_ms = int(time.time() * 1000)
+    if now_ms - last_status_update_ms >= STATUS_UPDATE_INTERVAL_SECONDS * 1000:
+        send_position_status_update(open_shorts, tickers)
+        last_status_update_ms = now_ms
 
     today = today_ist()
 
@@ -945,13 +1111,18 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             "tp_price": tp_price,
             "opened_at_ms": opened_at_ms,
             "simulated": DRY_RUN,
+            "leverage": leverage,                  # needed for the liquidation-distance estimate below
+            "liquidation_warning_sent": False,      # tracks whether the 50%-to-liquidation Telegram
+                                                     # alert has already fired for this position, so we
+                                                     # don't re-send it every single cycle it stays past
+                                                     # threshold — see check_liquidation_warnings().
         }
         save_state(open_shorts, daily_trade_tracker)
 
     # Returned so main()'s loop can carry the (possibly refreshed) market
     # data and refresh-date marker into the next cycle — run_once() itself
     # is stateless between calls otherwise.
-    return top_cap_symbols, usdt_inr_rate, last_market_refresh_date
+    return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
 
 
 def main():
@@ -988,6 +1159,11 @@ def main():
        # every startup so a restart can't silently forget a still-open position or reset
        # today's trade-count/P&L tracking.
 
+    # Seeded to 0 (not now_ms) so the very first cycle sends an immediate
+    # status update if anything got recovered above, instead of waiting a
+    # full 15 minutes after every restart before the first snapshot.
+    last_status_update_ms = 0
+
     print(f"DRY_RUN = {DRY_RUN}. Max {MAX_TRADES_PER_DAY} trades/day. "
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
     send_telegram_message(
@@ -996,9 +1172,9 @@ def main():
     )
     while True:
         try:
-            top_cap_symbols, usdt_inr_rate, last_market_refresh_date = run_once(
+            top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms = run_once(
                 instruments, top_cap_symbols, usdt_inr_rate, open_shorts,
-                daily_trade_tracker, last_market_refresh_date
+                daily_trade_tracker, last_market_refresh_date, last_status_update_ms
             )
         except requests.HTTPError as e:
             print(f"HTTP error this cycle: {e}")
