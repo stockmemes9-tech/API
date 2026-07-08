@@ -1,1 +1,1 @@
-worker: python coinswitch_resistance_short_bot.py
+worker: python check_balance_on_railway.py
