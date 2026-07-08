@@ -59,6 +59,7 @@ Run:
 
 import os
 import time
+import json
 import datetime
 import urllib.parse
 import requests
@@ -162,6 +163,24 @@ POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM_NOTIFICATIONS = os.environ.get("ENABLE_TELEGRAM_NOTIFICATIONS", "true").strip().lower() not in ("false", "0", "no")
+
+# --- Local state persistence ---
+# Restores in-memory bookkeeping (open_shorts + today's daily_trade_tracker
+# counters) across a restart. This is separate from recover_open_positions()
+# below, which re-derives *actual* open positions from CoinSwitch itself —
+# the exchange is always the source of truth for what's really open. What
+# the exchange can NOT tell us on restart is today's trade count / win-loss /
+# realized P&L so far (needed for MAX_TRADES_PER_DAY tracking and the daily
+# summary), or a DRY_RUN (simulated) short's take-profit price and true
+# entry time, since simulated trades never touched the real exchange at all.
+# This file exists purely to carry that bookkeeping across a restart; it is
+# never treated as authoritative for "is this symbol actually short right
+# now" on a real position — the live exchange check always wins for that.
+# On Railway without a mounted volume this path is ephemeral across
+# redeploys (fine — recover_open_positions() still works from the exchange
+# alone in that case, same as before this existed), but it survives a plain
+# process crash/restart within the same deployment.
+STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "bot_state.json")
 
 # =============================================================================
 
@@ -493,20 +512,94 @@ def set_leverage(symbol, leverage):
     return r.json()
 
 
+# ------------------------------ State persistence --------------------------------
+
+def save_state(open_shorts, daily_trade_tracker):
+    """Best-effort local persistence of in-memory bookkeeping. Called right
+    after every runtime mutation of open_shorts (new short opened, short
+    closed during reconcile) so a crash/redeploy between cycles loses at
+    most the last few seconds of state, not the whole day. Never raises —
+    a failed write here should not take down a trade cycle; worst case a
+    future restart falls back to the live-recovery-only behavior this bot
+    already had before state persistence existed."""
+    try:
+        payload = {
+            "open_shorts": open_shorts,
+            "daily_trade_tracker": daily_trade_tracker,
+            "saved_at_ms": int(time.time() * 1000),
+        }
+        tmp_path = STATE_FILE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, STATE_FILE_PATH)  # atomic on POSIX — avoids a torn/partial
+                                                # state file if the process dies mid-write
+    except Exception as e:
+        print(f"  [state] failed to save state file: {e}")
+
+
+def load_state():
+    """Returns (open_shorts, daily_trade_tracker) loaded from the local state
+    file, or (None, None) if it doesn't exist or can't be parsed. A missing
+    or corrupt file is NOT an error worth failing startup over — it just
+    means recovery falls back to live-exchange-only reconstruction, same as
+    before state persistence existed."""
+    try:
+        with open(STATE_FILE_PATH, "r") as f:
+            payload = json.load(f)
+        return payload.get("open_shorts") or {}, payload.get("daily_trade_tracker")
+    except FileNotFoundError:
+        return None, None
+    except Exception as e:
+        print(f"  [state] failed to load state file ({e}), starting without saved state.")
+        return None, None
+
+
 # ------------------------------ Startup recovery --------------------------------
 #
 # Runs once, before the scan loop starts. Without this, open_shorts always
 # starts empty on a restart (crash, redeploy, manual stop) — meaning a real
 # still-open position from before the restart would go untracked, and the
 # bot could open a second position on the same symbol without realizing one
-# already exists. This is a READ-ONLY call (no orders placed), so it's safe
-# to run regardless of DRY_RUN — right now, with DRY_RUN=true and the bot
-# never having placed a real order, it should simply find nothing.
+# already exists. The live exchange check below is READ-ONLY (no orders
+# placed), so it's safe to run regardless of DRY_RUN.
+#
+# The exchange alone can't tell us everything though: today's trade count /
+# win-loss / realized P&L (MAX_TRADES_PER_DAY + daily summary tracking), or
+# a DRY_RUN short's take-profit price and true entry time, since simulated
+# trades never touch the real exchange. That's what the local state file
+# (saved via save_state() on every mutation) fills in — real open positions
+# are still always re-derived from CoinSwitch itself as the source of truth.
 
-def recover_open_positions(instruments):
+def recover_open_positions(instruments, daily_trade_tracker):
+    state_open_shorts, state_daily_tracker = load_state()
+    state_open_shorts = state_open_shorts or {}
+
+    # Restore today's counters if the saved state is from today (IST).
+    # These can't be reconstructed from the exchange at all — without this,
+    # every restart mid-day would silently reset MAX_TRADES_PER_DAY tracking
+    # and the daily P&L stats sent in the end-of-day summary.
+    if state_daily_tracker and state_daily_tracker.get("date") == today_ist():
+        daily_trade_tracker.update(state_daily_tracker)
+        print(f"  [state] restored today's counters from saved state: "
+              f"{daily_trade_tracker['count']} trade(s) opened, "
+              f"{daily_trade_tracker['trades_closed']} closed, "
+              f"P&L so far {daily_trade_tracker['realized_pnl_usdt']:+.2f} USDT.")
+    elif state_daily_tracker:
+        print(f"  [state] saved state is from a previous day "
+              f"({state_daily_tracker.get('date')}), not restoring today's counters.")
+
+    # Simulated (DRY_RUN) shorts never touched the real exchange, so there's
+    # nothing to verify them against — the saved state IS the only record of
+    # them. Carry them over as-is.
+    recovered = {
+        symbol: pos for symbol, pos in state_open_shorts.items() if pos.get("simulated")
+    }
+    if recovered:
+        print(f"  [state] restored {len(recovered)} simulated (DRY RUN) open short(s) "
+              f"from saved state: {', '.join(recovered.keys())}")
+
     symbols = list(instruments.keys())
     print(f"Checking {len(symbols)} symbols on CoinSwitch for pre-existing open positions...")
-    recovered = {}
     for i, symbol in enumerate(symbols):
         try:
             positions = get_positions(symbol)
@@ -548,12 +641,24 @@ def recover_open_positions(instruments):
                 except (KeyError, ValueError, TypeError):
                     continue
 
+            # The exchange is always trusted over saved state for entry_price
+            # and qty (it's more current), but it has no concept of "our"
+            # take-profit order or the true opened_at_ms — backfill those
+            # from saved state when this symbol matches a real (non-simulated)
+            # entry recorded there.
+            saved = state_open_shorts.get(symbol)
+            if saved and not saved.get("simulated"):
+                tp_price = saved.get("tp_price")
+                opened_at_ms = saved.get("opened_at_ms", int(time.time() * 1000))
+            else:
+                tp_price = None
+                opened_at_ms = int(time.time() * 1000)  # true entry time unknown otherwise
+
             recovered[symbol] = {
                 "entry_price": entry_price,   # may be None if the field name didn't match — logged below either way
                 "qty": qty,
-                "tp_price": None,             # unknown for a recovered position; irrelevant for real (non-simulated)
-                                               # positions since those are closed-checked against the live API, not this.
-                "opened_at_ms": int(time.time() * 1000),  # true entry time unknown; P&L accounting starts from now
+                "tp_price": tp_price,
+                "opened_at_ms": opened_at_ms,
                 "simulated": False,           # always a real exchange position, regardless of today's DRY_RUN setting
             }
             print(f"  [recover] {symbol}: found an existing open position — now tracked. Raw: {p}")
@@ -564,13 +669,18 @@ def recover_open_positions(instruments):
                           # across a few hundred symbols.
 
     if recovered:
-        print(f"Recovered {len(recovered)} pre-existing open position(s): {', '.join(recovered.keys())}")
+        print(f"Recovered {len(recovered)} open position(s) total (live + saved simulated): "
+              f"{', '.join(recovered.keys())}")
         send_telegram_message(
-            f"Startup: recovered {len(recovered)} pre-existing open position(s) from CoinSwitch: "
+            f"Startup: recovered {len(recovered)} open position(s) from CoinSwitch/saved state: "
             f"{', '.join(recovered.keys())}"
         )
     else:
-        print("  [recover] no pre-existing open positions found.")
+        print("  [recover] no pre-existing open positions found (live or saved).")
+
+    save_state(recovered, daily_trade_tracker)  # persist the merged result immediately,
+                                                 # so a second restart before any trade
+                                                 # activity still has a consistent file.
     return recovered
 
 
@@ -656,6 +766,9 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             f"{'[DRY RUN] ' if DRY_RUN else ''}{symbol} position closed. P&L: {pnl:+.2f} USDT"
         )
 
+    if closed:
+        save_state(open_shorts, daily_trade_tracker)
+
 
 def send_daily_summary(daily_trade_tracker, open_shorts):
     pnl = daily_trade_tracker["realized_pnl_usdt"]
@@ -674,9 +787,36 @@ def send_daily_summary(daily_trade_tracker, open_shorts):
 
 # ------------------------------ Main loop ---------------------------------------
 
-def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker):
+def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
+             last_market_refresh_date):
     tickers = get_all_tickers()
     reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
+
+    today = today_ist()
+
+    # Refresh the top-100 market-cap exclusion list and the USDT/INR
+    # conversion rate once per IST calendar day. These were previously only
+    # ever fetched once at process startup and then reused for the entire
+    # lifetime of the container — on Railway that can mean running for days
+    # against a market-cap ranking and FX rate that are stale by then. A coin
+    # that's fallen out of (or risen into) the top 100 since startup would be
+    # screened against the wrong exclusion list, and the margin-per-trade
+    # sizing (CAPITAL_INR / usdt_inr_rate) would silently drift from its
+    # intended INR value as the real USDT/INR rate moves.
+    if last_market_refresh_date != today:
+        try:
+            top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
+            usdt_inr_rate = get_usdt_inr_rate()
+            last_market_refresh_date = today
+            print(f"  [refresh] top-100 market cap list and USDT/INR rate refreshed for {today} "
+                  f"(USDT/INR ~= {usdt_inr_rate}).")
+        except requests.HTTPError as e:
+            # Don't let a transient CoinGecko blip abort this cycle's scan —
+            # keep using the previous values and try the refresh again next
+            # cycle (last_market_refresh_date is only advanced on success).
+            print(f"  [refresh] failed to refresh market cap list / USDT-INR rate ({e}), "
+                  f"keeping previous values for this cycle.")
+
     candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
 
     # Fixed 15,000 INR margin per trade, converted to USDT at the live rate.
@@ -684,7 +824,6 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     # Reset the daily counters if the calendar day has rolled over (IST).
     # Send yesterday's P&L summary to Telegram before wiping the numbers.
-    today = today_ist()
     if daily_trade_tracker["date"] != today:
         send_daily_summary(daily_trade_tracker, open_shorts)
         daily_trade_tracker["date"] = today
@@ -693,6 +832,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         daily_trade_tracker["trades_closed"] = 0
         daily_trade_tracker["wins"] = 0
         daily_trade_tracker["losses"] = 0
+        save_state(open_shorts, daily_trade_tracker)
 
     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
           f"{len(candidates)} symbol(s) pass the market-cap/drop/volume filter. "
@@ -806,6 +946,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             "opened_at_ms": opened_at_ms,
             "simulated": DRY_RUN,
         }
+        save_state(open_shorts, daily_trade_tracker)
+
+    # Returned so main()'s loop can carry the (possibly refreshed) market
+    # data and refresh-date marker into the next cycle — run_once() itself
+    # is stateless between calls otherwise.
+    return top_cap_symbols, usdt_inr_rate, last_market_refresh_date
 
 
 def main():
@@ -814,15 +960,15 @@ def main():
         get_top_market_cap_symbols, TOP_N_MARKET_CAP_EXCLUDE, description="top-100 market cap list"
     )
     usdt_inr_rate = fetch_with_retry(get_usdt_inr_rate, description="USDT/INR rate")
+    # Seeded to today (IST) since we just fetched fresh values above — this
+    # stops run_once()'s daily refresh check (bug #6 fix) from immediately
+    # re-fetching on its very first cycle.
+    last_market_refresh_date = today_ist()
     print(f"USDT/INR ~= {usdt_inr_rate}")
 
     print("Fetching CoinSwitch futures instrument info...")
     instruments = fetch_with_retry(get_instrument_info, description="CoinSwitch instrument info")
 
-    open_shorts = fetch_with_retry(
-        recover_open_positions, instruments, description="recovering open positions from CoinSwitch"
-    )  # symbol -> {entry_price, qty, tp_price, opened_at_ms, simulated}; rebuilt from the real
-       # account on every startup so a restart can't silently forget a still-open position.
     daily_trade_tracker = {
         "date": today_ist(),
         "count": 0,               # trades opened today
@@ -830,7 +976,17 @@ def main():
         "wins": 0,
         "losses": 0,
         "realized_pnl_usdt": 0.0,
-    }  # resets at midnight IST; a summary is sent to Telegram right before the reset
+    }  # resets at midnight IST; a summary is sent to Telegram right before the reset.
+       # May be overwritten below by recover_open_positions() if a same-day
+       # saved state file exists (restores counters across a restart).
+
+    open_shorts = fetch_with_retry(
+        recover_open_positions, instruments, daily_trade_tracker,
+        description="recovering open positions from CoinSwitch"
+    )  # symbol -> {entry_price, qty, tp_price, opened_at_ms, simulated}; rebuilt from the real
+       # account (plus the local state file for bookkeeping the exchange can't provide) on
+       # every startup so a restart can't silently forget a still-open position or reset
+       # today's trade-count/P&L tracking.
 
     print(f"DRY_RUN = {DRY_RUN}. Max {MAX_TRADES_PER_DAY} trades/day. "
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
@@ -840,7 +996,10 @@ def main():
     )
     while True:
         try:
-            run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker)
+            top_cap_symbols, usdt_inr_rate, last_market_refresh_date = run_once(
+                instruments, top_cap_symbols, usdt_inr_rate, open_shorts,
+                daily_trade_tracker, last_market_refresh_date
+            )
         except requests.HTTPError as e:
             print(f"HTTP error this cycle: {e}")
             send_telegram_message(f"⚠️ HTTP error this cycle: {e}")
