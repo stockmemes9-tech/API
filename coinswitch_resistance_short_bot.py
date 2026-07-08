@@ -216,6 +216,10 @@ LOSS_ALERT_PCT = 10.0                      # alert once a position's unrealized 
                                             # margin actually put up for that trade, i.e. price move %
                                             # times leverage) reaches this. Independent of, and usually
                                             # fires well before, LIQUIDATION_WARNING_PCT.
+PRICE_MONITOR_INTERVAL_SECONDS = 30        # how often the dedicated fast-monitor thread (separate
+                                            # from the 5-minute scan cycle) re-checks open positions'
+                                            # live prices for the loss/liquidation alerts above — see
+                                            # price_monitor_loop().
 
 # --- Telegram notifications ---
 # 1. Message @BotFather on Telegram, send /newbot, follow the prompts -> you get a bot token.
@@ -1714,6 +1718,45 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                     send_telegram_message(f"⚠️ Closing {symbol} failed unexpectedly: {e}")
 
 
+def price_monitor_loop(open_shorts, daily_trade_tracker):
+    """Background thread, independent of the 5-minute scan cycle in run_once(),
+    that re-fetches live prices every PRICE_MONITOR_INTERVAL_SECONDS and
+    re-runs just the loss/liquidation alert checks against them. This is what
+    keeps those two alerts near-real-time instead of only being evaluated
+    once per 5-minute scan — a fast adverse move can otherwise sit unflagged
+    for most of a cycle.
+
+    Deliberately does NOT touch reconcile_open_shorts(), screen_candidates(),
+    or anything that opens/closes trades or does daily bookkeeping — this
+    thread only ever reads prices and (maybe) sends an alert, so it can't
+    race the main scan loop or the Telegram button-close handler on anything
+    beyond the two flags it sets. Everything it does touch is still taken
+    under state_lock, same as those other paths.
+
+    Skips the API call entirely when there's nothing open, so an idle bot
+    generates no extra request traffic."""
+    print(f"  [price monitor] fast loss/liquidation check every "
+          f"{PRICE_MONITOR_INTERVAL_SECONDS}s, independent of the {POLL_INTERVAL_SECONDS}s scan cycle.")
+    while True:
+        time.sleep(PRICE_MONITOR_INTERVAL_SECONDS)
+        if not open_shorts:
+            continue  # nothing open — no point spending an API call
+        try:
+            tickers = get_all_tickers()
+        except Exception as e:
+            print(f"  [price monitor] failed to fetch tickers ({e}), will retry next tick.")
+            continue
+
+        with state_lock:
+            changed = False
+            if check_liquidation_warnings(open_shorts, tickers):
+                changed = True
+            if check_loss_warnings(open_shorts, tickers):
+                changed = True
+            if changed:
+                save_state(open_shorts, daily_trade_tracker)
+
+
 # ------------------------------ Main loop ---------------------------------------
 
 def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
@@ -2034,7 +2077,8 @@ def main():
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
-        f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day.\n"
+        f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day. "
+        f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s.\n"
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
         f"Send /status any time for an on-demand snapshot, /history for closed trades, "
         f"/analytics for win rate/profit factor/drawdown stats, "
@@ -2051,6 +2095,14 @@ def main():
         target=telegram_polling_loop, args=(open_shorts, daily_trade_tracker), daemon=True
     )
     telegram_thread.start()
+
+    # Fast, independent loss/liquidation monitor — see price_monitor_loop()'s
+    # docstring for why this is safe to run alongside the scan loop and the
+    # Telegram polling thread above.
+    price_monitor_thread = threading.Thread(
+        target=price_monitor_loop, args=(open_shorts, daily_trade_tracker), daemon=True
+    )
+    price_monitor_thread.start()
 
     while True:
         try:
