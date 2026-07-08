@@ -278,7 +278,7 @@ LIQUIDATION_WARNING_PCT = 50.0             # alert once a position's adverse mov
                                             # % of the distance from entry to its estimated liquidation
                                             # price (see estimate_liquidation_price() for the caveats
                                             # on how that estimate is derived).
-LOSS_ALERT_PCT = 10.0                      # alert once a position's unrealized loss (as a % of the
+LOSS_ALERT_PCT = 30.0                      # alert once a position's unrealized loss (as a % of the
                                             # margin actually put up for that trade, i.e. price move %
                                             # times leverage) reaches this. Independent of, and usually
                                             # fires well before, LIQUIDATION_WARNING_PCT.
@@ -1387,7 +1387,7 @@ def check_loss_warnings(open_shorts, tickers):
     of the capital actually risked on this trade is currently under water).
     Mirrors check_liquidation_warnings()'s re-arm behaviour: if the position
     recovers back under the threshold it clears the flag, so a position that
-    dips past -10%, recovers, and dips again later gets alerted both times
+    dips past -30%, recovers, and dips again later gets alerted both times
     instead of going silent for the rest of its life."""
     changed = False
     for symbol, pos in open_shorts.items():
