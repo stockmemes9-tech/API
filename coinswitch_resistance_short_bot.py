@@ -7,7 +7,13 @@ Strategy (as described by the user):
     1. It is NOT in the top-100 cryptos by global market cap.
     2. It is down more than 5% in the last 24 hours.
     3. It has more than 10 crore (10,00,00,000) INR of trading volume in the last 24 hours.
-    4. On the 5-minute chart, price is currently sitting at a resistance level.
+    4. On the 5-minute chart, price is currently sitting at a resistance level,
+       confirmed by a rejection candle. Declining volume into the level is
+       also checked and, when it can be read, must actually be declining —
+       but if volume can't be determined from the candle data (e.g. the field
+       name doesn't match), this check is skipped rather than blocking the
+       trade (see is_volume_declining()'s True/False/None logic).
+    5. The symbol hasn't already been shorted (real or DRY_RUN) in the last 24 hours.
 
 This script:
     - Pulls the global top-100 market-cap list from CoinGecko (free, no key needed)
@@ -17,7 +23,12 @@ This script:
       reports, using a live USDT/INR rate from CoinGecko).
     - For each surviving symbol, pulls 5m candles and looks for swing-high
       ("pivot high") resistance levels, then checks whether the current price
-      is sitting just under one of them (optionally requiring a rejection wick).
+      is sitting just under one of them, requiring a rejection wick AND
+      declining volume into the level (see is_volume_declining()) before
+      treating it as confirmed.
+    - Skips any symbol that was already entered within the last 24 hours,
+      even if it closed and re-qualifies again in the meantime (see
+      ENTRY_COOLDOWN_HOURS / daily_trade_tracker["recent_entries"]).
     - If everything matches, places a MARKET short (no stop-loss order) and a
       take-profit limit order, and sends a Telegram alert for both.
 
@@ -150,6 +161,17 @@ PIVOT_WING = 3                        # candles on each side to confirm a swing 
 RESISTANCE_TOLERANCE_PCT = 0.4        # "at resistance" = within this % of a swing-high cluster
 REQUIRE_REJECTION_CANDLE = True       # also require the latest candle to show a rejection wick
 
+# Rule: only short if volume is FADING as price pushes up into the resistance
+# level, not rising into it. Rising volume into a level more often precedes a
+# breakout through it; declining volume suggests buyers are running out of
+# steam right at the level, which is the setup this bot is meant to catch.
+# See is_volume_declining() for exactly how "declining" is measured.
+REQUIRE_DECLINING_VOLUME = True
+VOLUME_DECLINE_LOOKBACK_CANDLES = 6   # ~30 minutes of 5m candles looked at for the volume trend
+VOLUME_DECLINE_MIN_PCT = 15.0         # 2nd half of that window must average at least this much
+                                       # lower volume than the 1st half to count as "declining"
+                                       # (a tiny/noisy dip shouldn't be enough to pass the filter)
+
 # --- Order sizing / risk ---
 CAPITAL_INR = 15_000                  # fixed margin per trade, in INR (converted to USDT at runtime)
 DESIRED_LEVERAGE = 5                  # target leverage; if a symbol's max_leverage is lower,
@@ -171,6 +193,16 @@ MAX_TRADES_PER_DAY = 10               # hard cap on new entries per calendar day
                                        # No cap on concurrent open positions — the bot will keep as many
                                        # open at once as the daily trade count and available wallet
                                        # balance allow.
+
+# Rule: never open a NEW short on a symbol that was already entered (real or
+# DRY_RUN) within the last this-many hours — even if it closed in the
+# meantime and re-qualifies later the same cycle or a later one. This is a
+# rolling 24h window per symbol, NOT tied to the IST calendar day the way
+# MAX_TRADES_PER_DAY is, so it survives a midnight rollover correctly (e.g.
+# a short opened at 23:50 IST still blocks re-entry into the next morning).
+# See daily_trade_tracker["recent_entries"] (symbol -> opened_at_ms) below.
+ENTRY_COOLDOWN_HOURS = 24
+ENTRY_COOLDOWN_MS = ENTRY_COOLDOWN_HOURS * 60 * 60 * 1000
 
 POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
 
@@ -545,6 +577,56 @@ def has_rejection_candle(candles):
     return close < o and upper_wick >= body
 
 
+def get_candle_volume(candle):
+    """Best-effort extraction of a kline's traded volume. Same caveat as the
+    other CoinSwitch field names guessed elsewhere in this file (see
+    get_realized_pnl / recover_open_positions): the exact key hasn't been
+    verified against a live response, so several common candidates are tried
+    in order. Print a few raw candles the first time you run this if the
+    declining-volume filter below ever looks like it's never confirming
+    anything — that's the sign the real key isn't in this list."""
+    for key in ("volume", "v", "base_asset_volume", "quote_asset_volume", "vol"):
+        if key in candle:
+            try:
+                return float(candle[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def is_volume_declining(candles, lookback=VOLUME_DECLINE_LOOKBACK_CANDLES,
+                         min_decline_pct=VOLUME_DECLINE_MIN_PCT):
+    """Returns True/False/None:
+      True  -> volume has clearly been shrinking over the most recent
+               `lookback` closed 5m candles (buying pressure fading right as
+               price pushes into the resistance level, rather than slamming
+               into it on rising volume, which more often precedes a breakout
+               rather than a rejection).
+      False -> volume was readable and is NOT declining — a real reason to
+               skip the trade.
+      None  -> volume couldn't be read/confirmed at all (missing field, not
+               enough candles yet, etc). This is treated as "unknown", not
+               as a failure — see evaluate_resistance(), which proceeds as
+               it did before this check existed rather than blocking every
+               trade over a field-name mismatch."""
+    window = candles[-lookback:]
+    if len(window) < lookback:
+        return None
+    volumes = [get_candle_volume(c) for c in window]
+    if any(v is None for v in volumes):
+        print("  [volume] couldn't read a volume field off these candles — "
+              "proceeding without the declining-volume check for this symbol.")
+        return None
+    mid = len(volumes) // 2
+    first_half, second_half = volumes[:mid], volumes[mid:]
+    avg_first = sum(first_half) / len(first_half)
+    avg_second = sum(second_half) / len(second_half)
+    if avg_first <= 0:
+        return None
+    decline_pct = (avg_first - avg_second) / avg_first * 100
+    return decline_pct >= min_decline_pct
+
+
 def evaluate_resistance(symbol, current_price):
     candles = get_klines(symbol)
     if len(candles) < (2 * PIVOT_WING + 5):
@@ -555,6 +637,13 @@ def evaluate_resistance(symbol, current_price):
         return None
     if REQUIRE_REJECTION_CANDLE and not has_rejection_candle(candles):
         return None
+    if REQUIRE_DECLINING_VOLUME:
+        # Only a confirmed False (volume readable and NOT declining) blocks
+        # the trade. None (unreadable/insufficient data) falls through and
+        # behaves like this check never existed, per your instruction not to
+        # let a missing volume field silently kill every signal.
+        if is_volume_declining(candles) is False:
+            return None
     return hit
 
 
@@ -707,8 +796,17 @@ def recover_open_positions(instruments, daily_trade_tracker):
               f"{daily_trade_tracker['trades_closed']} closed, "
               f"P&L so far {daily_trade_tracker['realized_pnl_usdt']:+.2f} USDT.")
     elif state_daily_tracker:
+        # Different calendar day — don't restore stale trade counts/P&L, but
+        # the 24h re-entry cooldown is a rolling window, not calendar-day
+        # based, so it still needs to survive across the midnight rollover
+        # (a symbol shorted at 23:50 IST yesterday should still be blocked
+        # from re-entry this morning, not get reset just because the date
+        # ticked over).
+        daily_trade_tracker["recent_entries"] = state_daily_tracker.get("recent_entries") or {}
         print(f"  [state] saved state is from a previous day "
-              f"({state_daily_tracker.get('date')}), not restoring today's counters.")
+              f"({state_daily_tracker.get('date')}), not restoring today's counters "
+              f"(24h re-entry cooldown timestamps were still restored).")
+    daily_trade_tracker.setdefault("recent_entries", {})
 
     # Simulated (DRY_RUN) shorts never touched the real exchange, so there's
     # nothing to verify them against — the saved state IS the only record of
@@ -1449,9 +1547,24 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                   f"paused (/resume to re-enable) — skipping new entries.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
 
+    # Drop cooldown entries older than the window so this dict doesn't grow
+    # forever across a long-running process — done once per cycle rather than
+    # per-candidate since it's the same cutoff for every symbol.
+    cooldown_cutoff_ms = now_ms - ENTRY_COOLDOWN_MS
+    daily_trade_tracker["recent_entries"] = {
+        s: t for s, t in daily_trade_tracker["recent_entries"].items() if t >= cooldown_cutoff_ms
+    }
+
     for cand in candidates:
         symbol = cand["symbol"]
         if symbol in open_shorts:
+            continue
+        last_entry_ms = daily_trade_tracker["recent_entries"].get(symbol)
+        if last_entry_ms is not None and last_entry_ms >= cooldown_cutoff_ms:
+            hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but was entered within the last "
+                  f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
             continue
         if daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
             print("  Daily trade limit reached, no further entries until tomorrow.")
@@ -1486,10 +1599,20 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         if resistance is None:
             continue
 
+        confirmations = []
+        if REQUIRE_REJECTION_CANDLE:
+            confirmations.append("rejection candle")
+        if REQUIRE_DECLINING_VOLUME:
+            # Note: this only means the volume check didn't block the trade —
+            # it may have actually confirmed declining volume, or it may have
+            # been inconclusive (unreadable field / not enough candles) and
+            # been allowed through anyway. See is_volume_declining()'s True/
+            # False/None return and evaluate_resistance() for the exact logic.
+            confirmations.append("volume check passed")
         print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
               f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
               f"price {cand['last_price']} at resistance ~{resistance:.6g} "
-              f"(resistance-confirmed{' + rejection candle' if REQUIRE_REJECTION_CANDLE else ''}) — SHORT signal")
+              f"(resistance-confirmed{' + ' + ' + '.join(confirmations) if confirmations else ''}) — SHORT signal")
 
         instrument = instruments.get(symbol)
         if instrument is None:
@@ -1576,6 +1699,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                                                          # don't re-send it every single cycle it stays past
                                                          # threshold — see check_liquidation_warnings().
             }
+            # Recorded for both real and DRY_RUN entries — the 24h no-re-entry
+            # rule is a screening/behavior decision, not an execution detail,
+            # so paper-trading runs should see the same cooldown live trading would.
+            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
             save_state(open_shorts, daily_trade_tracker)
 
     # Returned so main()'s loop can carry the (possibly refreshed) market
@@ -1606,6 +1733,9 @@ def main():
         "wins": 0,
         "losses": 0,
         "realized_pnl_usdt": 0.0,
+        "recent_entries": {},     # symbol -> opened_at_ms of its most recent entry (real or DRY_RUN),
+                                   # used for the 24h no-re-entry cooldown. Rolling window, NOT reset
+                                   # on the midnight-IST rollover below (see recover_open_positions()).
     }  # resets at midnight IST; a summary is sent to Telegram right before the reset.
        # May be overwritten below by recover_open_positions() if a same-day
        # saved state file exists (restores counters across a restart).
