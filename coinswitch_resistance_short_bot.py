@@ -1614,6 +1614,26 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
     )
 
 
+def send_help_message():
+    """Handles the /help (and /commands) command — sends a plain-text list of
+    every command this bot understands, so you don't have to remember them or
+    dig through the code. Doesn't touch open_shorts/daily_trade_tracker, so
+    it's safe to call without state_lock, same as send_trade_history()."""
+    lines = [
+        "🤖 Available commands:",
+        "",
+        "/status — on-demand snapshot of every open position's unrealized P&L",
+        "/history — closed-trade summary (win/loss, all-time P&L) + CSV file",
+        "/analytics — win rate, avg win/loss, win/loss streak stats",
+        "/cooldowns — symbols currently blocked by the 24h re-entry rule",
+        "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
+        "/pause — stop opening new trades (existing positions still monitored)",
+        "/resume — re-enable new trade entries after /pause",
+        "/help or /commands — this list",
+    ]
+    send_telegram_message("\n".join(lines))
+
+
 def send_on_demand_status(open_shorts, daily_trade_tracker):
     """Handles the /status command — an on-demand version of the periodic
     15-minute snapshot, sent immediately whenever you type /status in the
@@ -1811,7 +1831,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         return
 
     print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, "
-          "/cooldowns, /debugvolume, /pause, /resume commands...")
+          "/cooldowns, /debugvolume, /pause, /resume, /help commands...")
     offset = None
     while True:
         try:
@@ -1891,6 +1911,13 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         bot_paused.clear()
                         print("  [telegram] /resume — new entries re-enabled")
                         send_telegram_message("▶️ Resumed. Scanning for new entries again.")
+                elif text in ("/help", "/commands"):
+                    print("  [telegram] /help requested")
+                    try:
+                        send_help_message()
+                    except Exception as e:
+                        print(f"  [telegram] /help failed unexpectedly: {e}")
+                        send_telegram_message(f"⚠️ /help failed unexpectedly: {e}")
                 continue
 
             cq = update.get("callback_query")
