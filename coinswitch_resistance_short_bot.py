@@ -61,9 +61,19 @@ import os
 import time
 import json
 import datetime
+import threading
 import urllib.parse
 import requests
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+# Guards every read-modify-write access to open_shorts / daily_trade_tracker.
+# Two threads touch that shared state now: main()'s own 5-minute scan loop,
+# and telegram_polling_loop() (a separate daemon thread) reacting instantly
+# to a "Close" button tap in Telegram. Without this lock the two could
+# interleave mid-update (e.g. a manual close landing in the middle of
+# reconcile_open_shorts()'s own close-detection) and corrupt open_shorts or
+# double-count a closed trade.
+state_lock = threading.Lock()
 
 # All "day" boundaries (daily trade cap, daily P&L summary) are computed in
 # IST, since that's the trader's timezone — Railway's container clock is UTC
@@ -220,8 +230,12 @@ def sign_request(method, path, params=None):
 
 # ------------------------------ Telegram --------------------------------------
 
-def send_telegram_message(text):
-    """Best-effort Telegram alert. Never lets a notification failure crash a trade cycle."""
+def send_telegram_message(text, reply_markup=None):
+    """Best-effort Telegram alert. Never lets a notification failure crash a trade cycle.
+
+    reply_markup, if given, is a Telegram InlineKeyboardMarkup dict, e.g.
+    {"inline_keyboard": [[{"text": "...", "callback_data": "..."}]]} — used
+    to attach the per-position "Close" buttons to status updates."""
     if not ENABLE_TELEGRAM_NOTIFICATIONS:
         return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -229,9 +243,36 @@ def send_telegram_message(text):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"  [telegram] failed to send alert: {e}")
+
+
+def get_telegram_updates(offset=None, timeout=25):
+    """Long-polls Telegram's getUpdates endpoint for new messages/button taps.
+    Blocks up to ~timeout seconds server-side if there's nothing new yet —
+    that's what lets telegram_polling_loop() react to a "Close" tap within
+    a second or two instead of waiting for the next scan cycle."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    r = requests.get(url, params=params, timeout=timeout + 10)
+    r.raise_for_status()
+    return r.json().get("result", [])
+
+
+def answer_callback_query(callback_query_id, text=""):
+    """Acknowledges a button tap so Telegram stops showing the little loading
+    spinner on it. Best-effort — a failure here shouldn't block the close."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        requests.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"  [telegram] failed to answer callback query: {e}")
 
 
 # ------------------------------ Market cap -----------------------------------
@@ -937,50 +978,71 @@ def check_liquidation_warnings(open_shorts, tickers):
     return changed
 
 
-def send_position_status_update(open_shorts, tickers):
+def send_position_status_update(open_shorts, tickers, force_send=False):
     """Periodic (STATUS_UPDATE_INTERVAL_SECONDS) Telegram snapshot of every
-    open position's current unrealized P&L. Skips sending entirely when
-    nothing is open, so it doesn't spam an empty message every 15 minutes."""
-    if not open_shorts:
+    open position's current unrealized P&L, plus the free wallet balance and
+    one "❌ Close" button per open position — tapping it closes that position
+    immediately via telegram_polling_loop(), without waiting for the next
+    scan cycle. Skips sending entirely when nothing is open UNLESS
+    force_send is True (used by the on-demand /status command, which should
+    still reply with "no open positions" + wallet balance rather than go
+    silent)."""
+    if not open_shorts and not force_send:
         return
 
     lines = []
     total_unrealized = 0.0
     priced_count = 0
+    keyboard_rows = []
     for symbol, pos in open_shorts.items():
         entry_price = pos.get("entry_price")
         qty = pos.get("qty")
         t = tickers.get(symbol)
         if entry_price is None or qty is None or t is None:
             lines.append(f"{symbol}: price/qty unavailable this cycle")
-            continue
-        try:
-            current_price = float(t["last_price"])
-        except (KeyError, ValueError):
-            lines.append(f"{symbol}: current price unavailable this cycle")
-            continue
-
-        # SHORT: profit when price has fallen below entry.
-        unrealized = (entry_price - current_price) * qty
-        pct_move = (entry_price - current_price) / entry_price * 100
-        emoji = "🟢" if unrealized > 0 else ("🔴" if unrealized < 0 else "⚪")
-        total_unrealized += unrealized
-        priced_count += 1
-        lines.append(
-            f"{emoji} {symbol}{' [DRY RUN]' if pos.get('simulated') else ''}: "
-            f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
-            f"entry {entry_price} -> now {current_price}"
-        )
+        else:
+            try:
+                current_price = float(t["last_price"])
+            except (KeyError, ValueError):
+                current_price = None
+            if current_price is None:
+                lines.append(f"{symbol}: current price unavailable this cycle")
+            else:
+                # SHORT: profit when price has fallen below entry.
+                unrealized = (entry_price - current_price) * qty
+                pct_move = (entry_price - current_price) / entry_price * 100
+                emoji = "🟢" if unrealized > 0 else ("🔴" if unrealized < 0 else "⚪")
+                total_unrealized += unrealized
+                priced_count += 1
+                lines.append(
+                    f"{emoji} {symbol}{' [DRY RUN]' if pos.get('simulated') else ''}: "
+                    f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
+                    f"entry {entry_price} -> now {current_price}"
+                )
+        # One button per position regardless of whether it priced this cycle —
+        # you should always be able to close a stuck/unpriced position too.
+        keyboard_rows.append([{"text": f"❌ Close {symbol}", "callback_data": f"close:{symbol}"}])
 
     header_emoji = "🟢" if total_unrealized > 0 else ("🔴" if total_unrealized < 0 else "⚪")
-    msg = (
-        f"{header_emoji} Open positions status ({priced_count}/{len(open_shorts)} priced)\n"
-        + "\n".join(lines)
-    )
-    if priced_count:
-        msg += f"\nTotal unrealized P&L: {total_unrealized:+.2f} USDT"
+    if open_shorts:
+        msg = (
+            f"{header_emoji} Open positions status ({priced_count}/{len(open_shorts)} priced)\n"
+            + "\n".join(lines)
+        )
+        if priced_count:
+            msg += f"\nTotal unrealized P&L: {total_unrealized:+.2f} USDT"
+    else:
+        msg = "No open positions right now."
+
+    try:
+        wallet_balance = get_wallet_balance()
+        msg += f"\n\n💰 Wallet balance (free): {wallet_balance:.2f} USDT"
+    except Exception as e:
+        print(f"  [status update] wallet balance lookup failed: {e}")
+        msg += "\n\n💰 Wallet balance: unavailable this cycle"
+
     print(f"\n[status update] {msg}")
-    send_telegram_message(msg)
+    send_telegram_message(msg, reply_markup={"inline_keyboard": keyboard_rows} if keyboard_rows else None)
 
 
 def send_daily_summary(daily_trade_tracker, open_shorts):
@@ -998,23 +1060,181 @@ def send_daily_summary(daily_trade_tracker, open_shorts):
     send_telegram_message(msg)
 
 
+# ------------------------------ Manual close (Telegram button) -------------------
+
+def close_position_manual(symbol, open_shorts, daily_trade_tracker):
+    """Closes one open short immediately — triggered by tapping "❌ Close" under
+    a Telegram status update. Caller (telegram_polling_loop) MUST already hold
+    state_lock before calling this, since it reads-then-mutates open_shorts /
+    daily_trade_tracker, the same state the 5-minute scan loop touches."""
+    pos = open_shorts.get(symbol)
+    if pos is None:
+        send_telegram_message(f"⚠️ No open position found for {symbol} (already closed?).")
+        return
+
+    is_simulated = pos.get("simulated", DRY_RUN)
+    qty = pos.get("qty")
+    entry_price = pos.get("entry_price")
+
+    if is_simulated:
+        # Nothing real was ever placed on the exchange, so there's nothing to
+        # send a close order for — just estimate P&L off the latest known
+        # price so the daily tally stays meaningful, then drop it from tracking.
+        last_price = None
+        try:
+            tickers = get_all_tickers()
+            t = tickers.get(symbol)
+            if t is not None:
+                last_price = float(t["last_price"])
+        except Exception as e:
+            print(f"  [manual close] {symbol}: couldn't fetch price for P&L estimate ({e}).")
+        if entry_price is not None and last_price is not None and qty is not None:
+            pnl = (entry_price - last_price) * qty
+        else:
+            pnl = 0.0
+        print(f"  [manual close] {symbol}: [DRY RUN] closing simulated position, est P&L {pnl:+.2f} USDT.")
+    else:
+        try:
+            resp = place_order(symbol, side="BUY", order_type="MARKET", quantity=qty, reduce_only=True)
+            print(f"  [manual close] {symbol}: close order placed -> {resp['data']}")
+        except Exception as e:
+            print(f"  [manual close] {symbol}: failed to place close order ({e}).")
+            send_telegram_message(f"⚠️ Failed to close {symbol}: {e}")
+            return
+
+        # Give CoinSwitch a moment to settle the fill before asking for the
+        # realized P&L, same as the market-order entry path does implicitly
+        # via the next scan cycle — here we do it inline since this needs to
+        # respond right away.
+        time.sleep(2)
+        try:
+            pnl = get_realized_pnl(symbol, pos["opened_at_ms"])
+        except Exception as e:
+            print(f"  [manual close] {symbol}: P&L lookup failed ({e}), closing with unknown P&L.")
+            pnl = 0.0
+
+    del open_shorts[symbol]
+    daily_trade_tracker["realized_pnl_usdt"] += pnl
+    daily_trade_tracker["trades_closed"] += 1
+    if pnl >= 0:
+        daily_trade_tracker["wins"] += 1
+    else:
+        daily_trade_tracker["losses"] += 1
+    save_state(open_shorts, daily_trade_tracker)
+
+    send_telegram_message(
+        f"✅ {'[DRY RUN] ' if is_simulated else ''}{symbol} manually closed. P&L: {pnl:+.2f} USDT"
+    )
+
+
+def send_on_demand_status(open_shorts, daily_trade_tracker):
+    """Handles the /status command — an on-demand version of the periodic
+    15-minute snapshot, sent immediately whenever you type /status in the
+    chat rather than waiting for the timer. Caller MUST already hold
+    state_lock, same as close_position_manual()."""
+    try:
+        tickers = get_all_tickers()
+    except Exception as e:
+        print(f"  [telegram] /status: failed to fetch tickers ({e}).")
+        send_telegram_message(f"⚠️ Couldn't fetch current prices for /status: {e}")
+        return
+    send_position_status_update(open_shorts, tickers, force_send=True)
+
+
+def telegram_polling_loop(open_shorts, daily_trade_tracker):
+    """Runs for the lifetime of the process on its own daemon thread, separate
+    from main()'s 5-minute scan loop — this is what lets tapping "❌ Close" in
+    Telegram close a position within a second or two instead of waiting for
+    the next scan cycle, and lets /status reply instantly too. Uses
+    long-polling (getUpdates) rather than a webhook, since this bot doesn't
+    run a web server to receive one.
+
+    Every update's offset is advanced immediately, even for updates this loop
+    doesn't act on, so Telegram never re-delivers the same tap/message forever."""
+    if not ENABLE_TELEGRAM_NOTIFICATIONS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("  [telegram] button/command polling disabled (notifications off or token/chat id not set).")
+        return
+
+    print("  [telegram] listening for 'Close' button taps and /status commands...")
+    offset = None
+    while True:
+        try:
+            updates = get_telegram_updates(offset)
+        except Exception as e:
+            print(f"  [telegram] getUpdates failed ({e}), retrying in 10s...")
+            time.sleep(10)
+            continue
+
+        for update in updates:
+            offset = update["update_id"] + 1  # advance regardless of whether we handle this update
+
+            message = update.get("message")
+            if message is not None:
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue  # single-user bot — ignore messages from any other chat
+                # Strip a possible "@YourBotName" suffix (Telegram appends this
+                # to commands in group chats) before matching.
+                text = (message.get("text") or "").strip().split("@")[0].lower()
+                if text == "/status":
+                    print("  [telegram] /status requested")
+                    with state_lock:
+                        try:
+                            send_on_demand_status(open_shorts, daily_trade_tracker)
+                        except Exception as e:
+                            print(f"  [telegram] /status failed unexpectedly: {e}")
+                            send_telegram_message(f"⚠️ /status failed unexpectedly: {e}")
+                continue
+
+            cq = update.get("callback_query")
+            if not cq:
+                continue
+
+            chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                # This bot is single-user by design (it's sitting on your
+                # exchange keys) — ignore taps from any other chat.
+                answer_callback_query(cq.get("id", ""), "Not authorized.")
+                continue
+
+            data = cq.get("data", "")
+            if not data.startswith("close:"):
+                answer_callback_query(cq.get("id", ""))
+                continue
+
+            symbol = data[len("close:"):]
+            answer_callback_query(cq.get("id", ""), f"Closing {symbol}...")
+            print(f"  [telegram] 'Close' tapped for {symbol}")
+            with state_lock:
+                try:
+                    close_position_manual(symbol, open_shorts, daily_trade_tracker)
+                except Exception as e:
+                    print(f"  [telegram] manual close of {symbol} failed unexpectedly: {e}")
+                    send_telegram_message(f"⚠️ Closing {symbol} failed unexpectedly: {e}")
+
+
 # ------------------------------ Main loop ---------------------------------------
 
 def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
              last_market_refresh_date, last_status_update_ms):
     tickers = get_all_tickers()
-    reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
+    # Everything in this block reads and/or mutates open_shorts /
+    # daily_trade_tracker, the same state telegram_polling_loop() touches the
+    # instant a "Close" button is tapped — held under state_lock so a manual
+    # close can't interleave mid-reconcile and corrupt the shared dicts.
+    with state_lock:
+        reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
 
-    # Liquidation-distance check runs every cycle (not on the 15-minute
-    # status timer) since an adverse move can cross the warning threshold
-    # well before the next scheduled status update.
-    if check_liquidation_warnings(open_shorts, tickers):
-        save_state(open_shorts, daily_trade_tracker)
+        # Liquidation-distance check runs every cycle (not on the 15-minute
+        # status timer) since an adverse move can cross the warning threshold
+        # well before the next scheduled status update.
+        if check_liquidation_warnings(open_shorts, tickers):
+            save_state(open_shorts, daily_trade_tracker)
 
-    now_ms = int(time.time() * 1000)
-    if now_ms - last_status_update_ms >= STATUS_UPDATE_INTERVAL_SECONDS * 1000:
-        send_position_status_update(open_shorts, tickers)
-        last_status_update_ms = now_ms
+        now_ms = int(time.time() * 1000)
+        if now_ms - last_status_update_ms >= STATUS_UPDATE_INTERVAL_SECONDS * 1000:
+            send_position_status_update(open_shorts, tickers)
+            last_status_update_ms = now_ms
 
     today = today_ist()
 
@@ -1072,14 +1292,15 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # Reset the daily counters if the calendar day has rolled over (IST).
     # Send yesterday's P&L summary to Telegram before wiping the numbers.
     if daily_trade_tracker["date"] != today:
-        send_daily_summary(daily_trade_tracker, open_shorts)
-        daily_trade_tracker["date"] = today
-        daily_trade_tracker["count"] = 0
-        daily_trade_tracker["realized_pnl_usdt"] = 0.0
-        daily_trade_tracker["trades_closed"] = 0
-        daily_trade_tracker["wins"] = 0
-        daily_trade_tracker["losses"] = 0
-        save_state(open_shorts, daily_trade_tracker)
+        with state_lock:
+            send_daily_summary(daily_trade_tracker, open_shorts)
+            daily_trade_tracker["date"] = today
+            daily_trade_tracker["count"] = 0
+            daily_trade_tracker["realized_pnl_usdt"] = 0.0
+            daily_trade_tracker["trades_closed"] = 0
+            daily_trade_tracker["wins"] = 0
+            daily_trade_tracker["losses"] = 0
+            save_state(open_shorts, daily_trade_tracker)
 
     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
           f"{len(candidates)} symbol(s) pass the market-cap/drop/volume filter. "
@@ -1199,19 +1420,20 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                 f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital)"
             )
 
-        open_shorts[symbol] = {
-            "entry_price": cand["last_price"],
-            "qty": qty,
-            "tp_price": tp_price,
-            "opened_at_ms": opened_at_ms,
-            "simulated": DRY_RUN,
-            "leverage": leverage,                  # needed for the liquidation-distance estimate below
-            "liquidation_warning_sent": False,      # tracks whether the 50%-to-liquidation Telegram
-                                                     # alert has already fired for this position, so we
-                                                     # don't re-send it every single cycle it stays past
-                                                     # threshold — see check_liquidation_warnings().
-        }
-        save_state(open_shorts, daily_trade_tracker)
+        with state_lock:
+            open_shorts[symbol] = {
+                "entry_price": cand["last_price"],
+                "qty": qty,
+                "tp_price": tp_price,
+                "opened_at_ms": opened_at_ms,
+                "simulated": DRY_RUN,
+                "leverage": leverage,                  # needed for the liquidation-distance estimate below
+                "liquidation_warning_sent": False,      # tracks whether the 50%-to-liquidation Telegram
+                                                         # alert has already fired for this position, so we
+                                                         # don't re-send it every single cycle it stays past
+                                                         # threshold — see check_liquidation_warnings().
+            }
+            save_state(open_shorts, daily_trade_tracker)
 
     # Returned so main()'s loop can carry the (possibly refreshed) market
     # data and refresh-date marker into the next cycle — run_once() itself
@@ -1262,8 +1484,20 @@ def main():
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
-        f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day."
+        f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day.\n"
+        f"Tap ❌ Close under any position in a status update to close it instantly.\n"
+        f"Send /status any time for an on-demand snapshot."
     )
+
+    # Runs the whole time the process is up, independent of the 5-minute scan
+    # cycle above — this is what makes a "❌ Close" button tap in Telegram take
+    # effect within a second or two instead of waiting for the next scan.
+    # Daemon=True so it never blocks process shutdown on its own.
+    telegram_thread = threading.Thread(
+        target=telegram_polling_loop, args=(open_shorts, daily_trade_tracker), daemon=True
+    )
+    telegram_thread.start()
+
     while True:
         try:
             top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms = run_once(
