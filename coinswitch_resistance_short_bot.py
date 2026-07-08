@@ -647,6 +647,54 @@ def evaluate_resistance(symbol, current_price):
     return hit
 
 
+def send_volume_debug(symbol):
+    """Handles the /debugvolume SYMBOL command — fetches this symbol's most
+    recent 5m candles and shows exactly what raw fields CoinSwitch returned
+    for each one, alongside what get_candle_volume()/is_volume_declining()
+    actually parsed out of them. Use this to confirm the real key CoinSwitch
+    uses for kline volume instead of guessing from Railway logs — see
+    get_candle_volume()'s candidate-key list if this shows "UNREADABLE" for
+    every candle."""
+    try:
+        candles = get_klines(symbol, limit=max(VOLUME_DECLINE_LOOKBACK_CANDLES, 12))
+    except Exception as e:
+        send_telegram_message(f"⚠️ Couldn't fetch klines for {symbol}: {e}")
+        return
+    if not candles:
+        send_telegram_message(
+            f"No candles returned for {symbol} — check it's a valid CoinSwitch "
+            f"futures symbol (e.g. DOGEUSDT)."
+        )
+        return
+
+    lines = [f"🕵️ Volume debug for {symbol} — last {min(6, len(candles))} of {len(candles)} candle(s):"]
+    for c in candles[-6:]:
+        vol = get_candle_volume(c)
+        vol_str = f"{vol:g}" if vol is not None else "UNREADABLE"
+        # Dump every raw key CoinSwitch actually sent for this candle — not
+        # just the ones this script currently expects — so a mismatched
+        # volume field name (or anything else about the response shape) is
+        # visible directly rather than something to guess at from logs.
+        lines.append(f"{json.dumps(c, sort_keys=True)}\n  -> parsed volume: {vol_str}")
+
+    verdict = is_volume_declining(candles)
+    verdict_str = {
+        True: "TRUE — confirmed declining, this check would pass a short here",
+        False: "FALSE — readable but NOT declining, this check would block a short here",
+        None: "UNKNOWN — couldn't read volume (or not enough candles yet); "
+              "falls through and doesn't block, per your instruction",
+    }[verdict]
+    lines.append(f"\nis_volume_declining() verdict: {verdict_str}")
+
+    msg = "\n\n".join(lines)
+    # Telegram caps messages at 4096 chars; CoinSwitch candles can carry a
+    # variable number of extra fields, so trim defensively rather than let
+    # sendMessage silently fail on an oversized payload.
+    if len(msg) > 3800:
+        msg = msg[:3800] + "\n...[truncated — fewer candles or trim extra fields if you need the rest]"
+    send_telegram_message(msg)
+
+
 # ------------------------------ Sizing -----------------------------------------
 
 def round_step(value, step):
@@ -1311,6 +1359,31 @@ def send_on_demand_status(open_shorts, daily_trade_tracker):
     send_position_status_update(open_shorts, tickers, force_send=True)
 
 
+def send_cooldowns_status(daily_trade_tracker):
+    """Handles the /cooldowns command — lists every symbol currently blocked
+    by the 24h re-entry rule (see ENTRY_COOLDOWN_HOURS and
+    daily_trade_tracker["recent_entries"]) and how many hours remain until
+    each is eligible for a new entry again. Caller MUST already hold
+    state_lock, same as /status, since recent_entries is part of the shared
+    daily_trade_tracker dict the scan loop also mutates."""
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - ENTRY_COOLDOWN_MS
+    active = {
+        s: t for s, t in daily_trade_tracker.get("recent_entries", {}).items()
+        if t >= cutoff_ms
+    }
+    if not active:
+        send_telegram_message(f"No symbols currently on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown.")
+        return
+
+    lines = [f"⏳ {len(active)} symbol(s) on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown:"]
+    for symbol, opened_at_ms in sorted(active.items(), key=lambda kv: kv[1]):
+        hours_left = (opened_at_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+        entered_ist = datetime.datetime.fromtimestamp(opened_at_ms / 1000, IST).strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"  {symbol}: entered {entered_ist} IST — eligible again in ~{hours_left:.1f}h")
+    send_telegram_message("\n".join(lines))
+
+
 def send_trade_history():
     """Handles the /history command — a quick text summary of closed trades
     (win/loss count, all-time realized P&L, last 10) plus the full CSV as a
@@ -1468,7 +1541,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         print("  [telegram] button/command polling disabled (notifications off or token/chat id not set).")
         return
 
-    print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, /pause, /resume commands...")
+    print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, "
+          "/cooldowns, /debugvolume, /pause, /resume commands...")
     offset = None
     while True:
         try:
@@ -1511,6 +1585,26 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                     except Exception as e:
                         print(f"  [telegram] /analytics failed unexpectedly: {e}")
                         send_telegram_message(f"⚠️ /analytics failed unexpectedly: {e}")
+                elif text == "/cooldowns":
+                    print("  [telegram] /cooldowns requested")
+                    with state_lock:
+                        try:
+                            send_cooldowns_status(daily_trade_tracker)
+                        except Exception as e:
+                            print(f"  [telegram] /cooldowns failed unexpectedly: {e}")
+                            send_telegram_message(f"⚠️ /cooldowns failed unexpectedly: {e}")
+                elif text.startswith("/debugvolume"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_telegram_message("Usage: /debugvolume SYMBOL  (e.g. /debugvolume dogeusdt)")
+                    else:
+                        symbol = parts[1].upper()
+                        print(f"  [telegram] /debugvolume {symbol} requested")
+                        try:
+                            send_volume_debug(symbol)
+                        except Exception as e:
+                            print(f"  [telegram] /debugvolume failed unexpectedly: {e}")
+                            send_telegram_message(f"⚠️ /debugvolume failed unexpectedly: {e}")
                 elif text == "/pause":
                     if bot_paused.is_set():
                         send_telegram_message("⏸ Already paused — no new trades are being opened.")
@@ -1874,6 +1968,8 @@ def main():
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
         f"Send /status any time for an on-demand snapshot, /history for closed trades, "
         f"/analytics for win rate/profit factor/drawdown stats, "
+        f"/cooldowns to see symbols on the 24h re-entry cooldown, "
+        f"/debugvolume SYMBOL to inspect raw kline volume data, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
 
