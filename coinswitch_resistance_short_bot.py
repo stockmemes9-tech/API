@@ -1348,6 +1348,112 @@ def send_trade_history():
     send_telegram_document(TRADE_HISTORY_FILE_PATH, caption="Full trade history (CSV)")
 
 
+def compute_trade_analytics(rows):
+    """Computes summary stats from closed-trade rows (as read via
+    csv.DictReader from trade_history.csv). Returns a dict with:
+      total_trades, wins, losses, win_rate_pct,
+      gross_profit_usdt, gross_loss_usdt (positive number),
+      profit_factor (gross_profit / gross_loss, None if there are no losses),
+      avg_win_usdt, avg_loss_usdt (positive number),
+      win_loss_ratio (avg_win / avg_loss, None if there are no losses),
+      expectancy_usdt (average P&L per trade, win or lose),
+      max_drawdown_usdt, max_drawdown_pct (peak-to-trough on the cumulative
+      realized-P&L equity curve; pct is None if no positive peak exists yet).
+
+    NOTE on "R:R": this bot places no fixed stop-loss (see the no-stop-loss
+    warning in the CONFIG section), so there's no fixed "risk" distance to
+    compute a textbook risk:reward ratio against — the downside on any given
+    trade is whatever it happens to be, not a pre-defined amount. win/loss
+    ratio and profit factor below are the closest meaningful substitutes
+    given that.
+    """
+    # Rows are appended in real closing order, but sort defensively by the
+    # "%Y-%m-%d %H:%M:%S" closed_at_ist string (which sorts correctly as
+    # plain text) so the equity curve/drawdown calc below is never fooled by
+    # e.g. a manually edited or reordered CSV.
+    pnls = []
+    for r in rows:
+        try:
+            pnls.append((r.get("closed_at_ist", ""), float(r["pnl_usdt"])))
+        except (KeyError, ValueError, TypeError):
+            continue
+    pnls.sort(key=lambda x: x[0])
+
+    total_trades = len(pnls)
+    wins = [p for _, p in pnls if p >= 0]
+    losses = [p for _, p in pnls if p < 0]
+
+    gross_profit = sum(wins)
+    gross_loss = -sum(losses)  # stored/reported as a positive number
+
+    equity = 0.0
+    peak = 0.0
+    max_dd_usdt = 0.0
+    max_dd_pct = None
+    for _, p in pnls:
+        equity += p
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_dd_usdt:
+            max_dd_usdt = drawdown
+            max_dd_pct = (drawdown / peak * 100) if peak > 0 else None
+
+    return {
+        "total_trades": total_trades,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": (len(wins) / total_trades * 100) if total_trades else 0.0,
+        "gross_profit_usdt": gross_profit,
+        "gross_loss_usdt": gross_loss,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
+        "avg_win_usdt": (gross_profit / len(wins)) if wins else 0.0,
+        "avg_loss_usdt": (gross_loss / len(losses)) if losses else 0.0,
+        "win_loss_ratio": ((gross_profit / len(wins)) / (gross_loss / len(losses)))
+                           if wins and losses else None,
+        "expectancy_usdt": (sum(p for _, p in pnls) / total_trades) if total_trades else 0.0,
+        "max_drawdown_usdt": max_dd_usdt,
+        "max_drawdown_pct": max_dd_pct,
+    }
+
+
+def send_trade_analytics():
+    """Handles the /analytics command — win rate, avg win/loss, win/loss
+    ratio, profit factor, expectancy, and max drawdown, all computed from the
+    full trade-history CSV. Read-only against the CSV file, same as
+    /history, so it's safe to call without state_lock."""
+    if not os.path.exists(TRADE_HISTORY_FILE_PATH):
+        send_telegram_message("No trades closed yet — nothing to analyze.")
+        return
+    try:
+        with open(TRADE_HISTORY_FILE_PATH, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        send_telegram_message(f"⚠️ Couldn't read trade history: {e}")
+        return
+    if not rows:
+        send_telegram_message("No trades closed yet — nothing to analyze.")
+        return
+
+    a = compute_trade_analytics(rows)
+    profit_factor_str = f"{a['profit_factor']:.2f}" if a["profit_factor"] is not None else "n/a (no losses yet)"
+    win_loss_ratio_str = f"{a['win_loss_ratio']:.2f}" if a["win_loss_ratio"] is not None else "n/a"
+    drawdown_pct_str = f" ({a['max_drawdown_pct']:.1f}% off peak)" if a["max_drawdown_pct"] is not None else ""
+
+    msg = (
+        f"📊 Trade analytics — {a['total_trades']} closed trade(s)\n"
+        f"Win rate: {a['win_rate_pct']:.1f}%  (W {a['wins']} / L {a['losses']})\n"
+        f"Avg win: {a['avg_win_usdt']:+.2f} USDT  |  Avg loss: -{a['avg_loss_usdt']:.2f} USDT\n"
+        f"Win/loss ratio: {win_loss_ratio_str}  |  Profit factor: {profit_factor_str}\n"
+        f"Expectancy per trade: {a['expectancy_usdt']:+.2f} USDT\n"
+        f"Max drawdown (equity curve): -{a['max_drawdown_usdt']:.2f} USDT{drawdown_pct_str}\n\n"
+        f"Note: no fixed stop-loss is set on these trades, so win/loss ratio "
+        f"and profit factor are shown instead of a textbook risk:reward "
+        f"ratio — there's no fixed risk distance to compute one against."
+    )
+    send_telegram_message(msg)
+
+
 def telegram_polling_loop(open_shorts, daily_trade_tracker):
     """Runs for the lifetime of the process on its own daemon thread, separate
     from main()'s 5-minute scan loop — this is what lets tapping "❌ Close" in
@@ -1362,7 +1468,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         print("  [telegram] button/command polling disabled (notifications off or token/chat id not set).")
         return
 
-    print("  [telegram] listening for 'Close' taps and /status, /history, /pause, /resume commands...")
+    print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, /pause, /resume commands...")
     offset = None
     while True:
         try:
@@ -1398,6 +1504,13 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                     except Exception as e:
                         print(f"  [telegram] /history failed unexpectedly: {e}")
                         send_telegram_message(f"⚠️ /history failed unexpectedly: {e}")
+                elif text == "/analytics":
+                    print("  [telegram] /analytics requested")
+                    try:
+                        send_trade_analytics()
+                    except Exception as e:
+                        print(f"  [telegram] /analytics failed unexpectedly: {e}")
+                        send_telegram_message(f"⚠️ /analytics failed unexpectedly: {e}")
                 elif text == "/pause":
                     if bot_paused.is_set():
                         send_telegram_message("⏸ Already paused — no new trades are being opened.")
@@ -1760,6 +1873,7 @@ def main():
         f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day.\n"
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
         f"Send /status any time for an on-demand snapshot, /history for closed trades, "
+        f"/analytics for win rate/profit factor/drawdown stats, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
 
