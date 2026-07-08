@@ -300,7 +300,20 @@ def get_positions(symbol, max_retries=3, retry_delay_seconds=2.0):
             time.sleep(retry_delay_seconds * (2 ** attempt))
             continue
         r.raise_for_status()
-        return r.json()["data"]
+        body = r.json()
+        if "data" not in body:
+            # CoinSwitch returned 200 OK (raise_for_status didn't catch this)
+            # but the body doesn't have the shape we expect — e.g. an error
+            # wrapped as {"message": ...} without a "data" key, on some
+            # symbols. Print the raw body so this is diagnosable from logs
+            # instead of surfacing as an opaque KeyError('data'), and raise
+            # something the caller can catch alongside HTTPError so ONE bad
+            # symbol doesn't abort the whole recovery scan.
+            raise RuntimeError(
+                f"CoinSwitch /positions response for {symbol} has no 'data' field. "
+                f"HTTP {r.status_code}, raw body: {body}"
+            )
+        return body["data"]
 
 
 def get_realized_pnl(symbol, from_time_ms):
@@ -616,10 +629,21 @@ def recover_open_positions(instruments, daily_trade_tracker):
     for i, symbol in enumerate(symbols):
         try:
             positions = get_positions(symbol)
-        except requests.HTTPError as e:
+        except Exception as e:
+            # Deliberately broad, not just requests.HTTPError: a malformed
+            # response (e.g. HTTP 200 with an unexpected body shape) used to
+            # escape this try/except entirely and abort the whole startup
+            # scan, which fetch_with_retry() would then restart from symbol
+            # #1 — hitting the exact same failure forever and never actually
+            # starting the bot. Skipping just this one symbol and continuing
+            # is a much safer failure mode; SystemExit/KeyboardInterrupt
+            # still propagate normally since neither is an Exception subclass.
             print(f"  [recover] {symbol}: position check failed ({e}), skipping. "
                   f"If this symbol genuinely has an open position, it won't be tracked "
                   f"until a future restart succeeds in checking it.")
+            time.sleep(3.1)  # still pace this like a normal call, so a run of
+                              # consecutive bad-response symbols can't 429-storm
+                              # the API the way an un-paced tight loop would.
             continue
 
         if positions:
@@ -760,7 +784,12 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
         else:
             try:
                 live_positions = get_positions(symbol)
-            except requests.HTTPError as e:
+            except Exception as e:
+                # Broad on purpose, same reasoning as recover_open_positions():
+                # a non-HTTPError failure here (e.g. a malformed 200 response)
+                # used to escape uncaught and abort reconciliation for every
+                # OTHER open symbol this cycle too, since this sits inside a
+                # for-loop with only a per-iteration try/except around it.
                 print(f"  [reconcile] {symbol}: position check failed ({e}), leaving tracked as open.")
                 continue
 
