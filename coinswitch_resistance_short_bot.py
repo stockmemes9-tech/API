@@ -70,6 +70,8 @@ Run:
 
 import os
 import csv
+import sys
+import signal
 import time
 import json
 import datetime
@@ -107,6 +109,56 @@ connectivity_state = {
     "first_failure_ms": None,
     "last_error": None,
 }
+
+# Populated by main() once open_shorts/daily_trade_tracker exist, so the
+# signal handler below (which fires on the main thread, asynchronously,
+# whenever the process gets SIGTERM/SIGINT) has something to save. See
+# _handle_shutdown_signal().
+_shutdown_context = {"open_shorts": None, "daily_trade_tracker": None}
+
+
+def _handle_shutdown_signal(signum, frame):
+    """Registered for SIGTERM (what Railway sends on redeploy/restart/stop)
+    and SIGINT (Ctrl+C locally). Without this, a mid-cycle kill can lose any
+    state changes since the last save_state() call — e.g. a position closed
+    seconds ago, or today's running P&L — since those live only in memory
+    between saves. This makes shutdown itself a save point instead of a gap.
+
+    Deliberately best-effort and fast: grabs state_lock, writes the state
+    file, fires one Telegram notice, and exits. Doesn't try to close open
+    positions or do anything else that could take a while or fail loudly —
+    the point is to preserve bookkeeping, not to trade on the way out."""
+    sig_name = signal.Signals(signum).name
+    print(f"\n[shutdown] received {sig_name}, saving state before exiting...")
+
+    open_shorts = _shutdown_context.get("open_shorts")
+    daily_trade_tracker = _shutdown_context.get("daily_trade_tracker")
+    saved_ok = False
+    if open_shorts is not None and daily_trade_tracker is not None:
+        try:
+            with state_lock:
+                save_state(open_shorts, daily_trade_tracker)
+            saved_ok = True
+            print("[shutdown] state saved.")
+        except Exception as e:
+            print(f"[shutdown] failed to save state: {e}")
+
+    try:
+        send_telegram_message(
+            f"🛑 Bot received {sig_name} and is shutting down.\n"
+            + (f"State saved ({len(open_shorts)} open position(s) preserved)."
+               if saved_ok else "⚠️ State save failed or hadn't started yet — check logs.")
+        )
+    except Exception as e:
+        print(f"[shutdown] failed to send Telegram notice: {e}")
+
+    try:
+        backup_trade_history()
+    except Exception as e:
+        print(f"[shutdown] failed to back up trade history: {e}")
+
+    sys.exit(0)
+
 
 # All "day" boundaries (daily trade cap, daily P&L summary) are computed in
 # IST, since that's the trader's timezone — Railway's container clock is UTC
@@ -452,13 +504,31 @@ def get_usdt_inr_rate():
 
 # ------------------------------ CoinSwitch data -------------------------------
 
-def get_all_tickers():
+def get_all_tickers(max_retries=2, retry_delay_seconds=2.0):
+    """GET is idempotent, so unlike place_order() below it's safe to retry
+    this on ANY transient failure — rate limiting (429) or a dropped
+    connection/timeout — not just 429. A retry can never double-submit
+    anything here."""
     headers, path = sign_request(
         "GET", "/trade/api/v2/futures/all-pairs/ticker", {"exchange": EXCHANGE}
     )
-    r = requests.get(BASE_URL + path, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()["data"]
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(BASE_URL + path, headers=headers, timeout=15)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < max_retries:
+                wait = retry_delay_seconds * (2 ** attempt)
+                print(f"  [tickers] network error ({e}), retrying in {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+            raise
+        if r.status_code == 429 and attempt < max_retries:
+            wait = retry_delay_seconds * (2 ** attempt)
+            print(f"  [tickers] rate-limited (429), retrying in {wait:.1f}s...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()["data"]
 
 
 def get_klines(symbol, interval=KLINE_INTERVAL, limit=RESISTANCE_LOOKBACK_CANDLES,
@@ -540,22 +610,38 @@ def get_realized_pnl(symbol, from_time_ms):
     return total
 
 
-def get_wallet_balance():
+def get_wallet_balance(max_retries=2, retry_delay_seconds=2.0):
     """Returns the available USDT futures wallet balance (float) — the amount
     free to use for new orders/margin, per CoinSwitch's Get Wallet Balance
     endpoint. Raises requests.HTTPError on failure (caller decides how to
-    handle a transient lookup failure)."""
+    handle a transient lookup failure). GET is idempotent, so — same
+    reasoning as get_all_tickers() — this retries on both 429 and transient
+    network errors, not just rate limiting."""
     headers, path = sign_request("GET", "/trade/api/v2/futures/wallet_balance")
-    r = requests.get(BASE_URL + path, headers=headers, timeout=15)
-    r.raise_for_status()
-    base_asset_balances = r.json()["data"]["base_asset_balances"]
-    for entry in base_asset_balances:
-        if entry.get("base_asset") == "USDT":
-            return float(entry["balances"]["total_available_balance"])
-    # No USDT row at all — treat as zero available rather than raising, so a
-    # single unexpected response shape doesn't crash the whole scan cycle.
-    print(f"  [wallet] no USDT entry found in wallet balance response: {base_asset_balances}")
-    return 0.0
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(BASE_URL + path, headers=headers, timeout=15)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < max_retries:
+                wait = retry_delay_seconds * (2 ** attempt)
+                print(f"  [wallet] network error ({e}), retrying in {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+            raise
+        if r.status_code == 429 and attempt < max_retries:
+            wait = retry_delay_seconds * (2 ** attempt)
+            print(f"  [wallet] rate-limited (429), retrying in {wait:.1f}s...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        base_asset_balances = r.json()["data"]["base_asset_balances"]
+        for entry in base_asset_balances:
+            if entry.get("base_asset") == "USDT":
+                return float(entry["balances"]["total_available_balance"])
+        # No USDT row at all — treat as zero available rather than raising, so a
+        # single unexpected response shape doesn't crash the whole scan cycle.
+        print(f"  [wallet] no USDT entry found in wallet balance response: {base_asset_balances}")
+        return 0.0
 
 
 def get_instrument_info():
@@ -568,7 +654,16 @@ def get_instrument_info():
 
 
 def place_order(symbol, side, order_type, quantity, price=None,
-                 trigger_price=None, reduce_only=False):
+                 trigger_price=None, reduce_only=False, max_retries=2, retry_delay_seconds=2.0):
+    """POST is NOT idempotent — a retry after an ambiguous failure risks
+    placing the same order twice, which is a much worse outcome than one
+    missed cycle. So unlike the GET helpers above, this ONLY retries on 429
+    (rate limited): a 429 response is a guarantee the order was rejected
+    before ever reaching the matching engine, so retrying it is safe. A
+    ConnectionError or Timeout, by contrast, means we genuinely don't know
+    whether CoinSwitch received and processed the order before the
+    connection dropped — those are deliberately NOT retried here and are
+    left to propagate to the caller instead."""
     body = {
         "exchange": EXCHANGE,
         "symbol": symbol,
@@ -587,9 +682,15 @@ def place_order(symbol, side, order_type, quantity, price=None,
         return {"data": {"order_id": "DRY-RUN", "status": "DRY_RUN"}}
 
     headers, path = sign_request("POST", "/trade/api/v2/futures/order")
-    r = requests.post(BASE_URL + path, headers=headers, json=body, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(max_retries + 1):
+        r = requests.post(BASE_URL + path, headers=headers, json=body, timeout=15)
+        if r.status_code == 429 and attempt < max_retries:
+            wait = retry_delay_seconds * (2 ** attempt)
+            print(f"  [order] rate-limited (429) placing order for {symbol}, retrying in {wait:.1f}s...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 # ------------------------------ Screener step ---------------------------------
@@ -1423,6 +1524,28 @@ def send_daily_summary(daily_trade_tracker, open_shorts):
     send_telegram_message(msg)
 
 
+def backup_trade_history():
+    """Sends TRADE_HISTORY_FILE_PATH to Telegram as a document — the same
+    thing the /history command does on demand, but run automatically once a
+    day at the midnight-IST rollover. Railway's filesystem is ephemeral (a
+    redeploy or restart can wipe it), so this is what actually makes the
+    trade history durable: it lands in Telegram's chat history, off-Railway,
+    once a day, rather than only existing as a local CSV that a bad restart
+    could lose entirely. Best-effort — a failed backup shouldn't crash the
+    daily-rollover cycle that calls it."""
+    if not os.path.exists(TRADE_HISTORY_FILE_PATH):
+        print("  [backup] no trade history file yet — nothing to back up today.")
+        return
+    try:
+        send_telegram_document(
+            TRADE_HISTORY_FILE_PATH,
+            caption=f"📦 Daily trade history backup — {today_ist()}"
+        )
+        print(f"  [backup] sent {TRADE_HISTORY_FILE_PATH} to Telegram.")
+    except Exception as e:
+        print(f"  [backup] failed to send trade history backup: {e}")
+
+
 # ------------------------------ Manual close (Telegram button) -------------------
 
 def close_position_manual(symbol, open_shorts, daily_trade_tracker):
@@ -1982,6 +2105,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     if daily_trade_tracker["date"] != today:
         with state_lock:
             send_daily_summary(daily_trade_tracker, open_shorts)
+            backup_trade_history()
             daily_trade_tracker["date"] = today
             daily_trade_tracker["count"] = 0
             daily_trade_tracker["realized_pnl_usdt"] = 0.0
@@ -2204,6 +2328,15 @@ def main():
        # account (plus the local state file for bookkeeping the exchange can't provide) on
        # every startup so a restart can't silently forget a still-open position or reset
        # today's trade-count/P&L tracking.
+
+    # Wire up graceful shutdown now that open_shorts/daily_trade_tracker exist
+    # — SIGTERM (Railway redeploy/restart/stop) and SIGINT (Ctrl+C locally)
+    # both save state before the process actually exits. See
+    # _handle_shutdown_signal()'s docstring for what this does and doesn't do.
+    _shutdown_context["open_shorts"] = open_shorts
+    _shutdown_context["daily_trade_tracker"] = daily_trade_tracker
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     # Seeded to 0 (not now_ms) so the very first cycle sends an immediate
     # status update if anything got recovered above, instead of waiting a
