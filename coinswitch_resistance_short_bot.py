@@ -1050,19 +1050,24 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # If there isn't enough free margin for even one trade, there's no point
     # scanning/evaluating candidates at all this cycle — just wait for the
     # wallet to be topped up (or for a position to close and free margin)
-    # and try again next cycle. DRY_RUN still checks this against the real
-    # account so paper-trading behaves the same way live trading would.
+    # and try again next cycle. This gate is skipped entirely when DRY_RUN
+    # is on, so paper-trading can keep scanning/simulating regardless of the
+    # real account balance. It's still enforced for live trading.
     try:
         available_balance_usdt = get_wallet_balance()
     except requests.HTTPError as e:
         print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
 
-    if available_balance_usdt < order_margin_usdt:
+    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
               f"{order_margin_usdt:.2f} USDT needed for one trade — not searching for new trades "
               f"this cycle. Existing open positions are unaffected.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+    elif DRY_RUN and available_balance_usdt < order_margin_usdt:
+        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
+              f"{order_margin_usdt:.2f} USDT needed for one trade — continuing to scan anyway "
+              f"since DRY_RUN is on (no real orders will be placed).")
 
     # Reset the daily counters if the calendar day has rolled over (IST).
     # Send yesterday's P&L summary to Telegram before wiping the numbers.
@@ -1088,11 +1093,13 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             print("  Daily trade limit reached, no further entries until tomorrow.")
             break
         # No cap on how many positions can be open at once — the only limits
-        # are the daily trade count above and the wallet balance below.
-        # available_balance_usdt is decremented locally (not re-fetched) as
-        # each trade in this cycle consumes margin, so a burst of candidates
-        # in one cycle can't collectively overdraw the wallet.
-        if available_balance_usdt < order_margin_usdt:
+        # are the daily trade count above and (in live trading) the wallet
+        # balance below. available_balance_usdt is decremented locally (not
+        # re-fetched) as each trade in this cycle consumes margin, so a burst
+        # of candidates in one cycle can't collectively overdraw the wallet.
+        # This check is skipped in DRY_RUN, so simulated runs aren't capped
+        # by the real account balance.
+        if not DRY_RUN and available_balance_usdt < order_margin_usdt:
             print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is now below "
                   f"the {order_margin_usdt:.2f} USDT needed for another trade — stopping new "
                   f"entries for this cycle.")
