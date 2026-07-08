@@ -58,6 +58,7 @@ Run:
 """
 
 import os
+import csv
 import time
 import json
 import datetime
@@ -74,6 +75,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 # reconcile_open_shorts()'s own close-detection) and corrupt open_shorts or
 # double-count a closed trade.
 state_lock = threading.Lock()
+
+# Set by the /pause command, cleared by /resume (see telegram_polling_loop()).
+# Gates ONLY the opening of new trades in run_once() — reconciliation,
+# liquidation warnings, status updates, and manual closes all keep working
+# normally while paused, so you can still monitor and exit existing
+# positions, you just won't get new entries.
+bot_paused = threading.Event()
 
 # All "day" boundaries (daily trade cap, daily P&L summary) are computed in
 # IST, since that's the trader's timezone — Railway's container clock is UTC
@@ -201,6 +209,12 @@ ENABLE_TELEGRAM_NOTIFICATIONS = os.environ.get("ENABLE_TELEGRAM_NOTIFICATIONS", 
 # process crash/restart within the same deployment.
 STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "bot_state.json")
 
+# Every trade that closes (auto TP, exchange-detected close, or manual /
+# Telegram-button close) gets one row appended here — see record_trade_close()
+# and the /history command in telegram_polling_loop(). Same ephemeral-on-Railway
+# caveat as STATE_FILE_PATH applies unless a volume is mounted.
+TRADE_HISTORY_FILE_PATH = os.environ.get("TRADE_HISTORY_FILE_PATH", "trade_history.csv")
+
 # =============================================================================
 
 
@@ -273,6 +287,25 @@ def answer_callback_query(callback_query_id, text=""):
         requests.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=10)
     except Exception as e:
         print(f"  [telegram] failed to answer callback query: {e}")
+
+
+def send_telegram_document(file_path, caption=""):
+    """Sends a file (used for attaching the full trade-history CSV to a
+    /history reply) to the configured chat. Best-effort, same as
+    send_telegram_message — a failed attachment never crashes the caller."""
+    if not ENABLE_TELEGRAM_NOTIFICATIONS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        with open(file_path, "rb") as f:
+            requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"document": (os.path.basename(file_path), f)},
+                timeout=30,
+            )
+    except Exception as e:
+        print(f"  [telegram] failed to send document: {e}")
 
 
 # ------------------------------ Market cap -----------------------------------
@@ -826,6 +859,40 @@ def recover_open_positions(instruments, daily_trade_tracker):
 # tracked short has actually closed, and if so, drop it from open_shorts and
 # fold its P&L into the daily tracker.
 
+def record_trade_close(symbol, pos, pnl, reason):
+    """Appends one row to the trade-history CSV for every position that
+    closes, however it closed (take-profit, manual Telegram button, or
+    detected already-closed on the exchange). Best-effort — a logging
+    failure here should never block or fail the actual close."""
+    try:
+        file_exists = os.path.exists(TRADE_HISTORY_FILE_PATH)
+        with open(TRADE_HISTORY_FILE_PATH, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "closed_at_ist", "symbol", "entry_price", "qty", "leverage",
+                    "pnl_usdt", "simulated", "reason", "opened_at_ist",
+                ])
+            opened_at_ms = pos.get("opened_at_ms")
+            opened_at_ist = (
+                datetime.datetime.fromtimestamp(opened_at_ms / 1000, IST).strftime("%Y-%m-%d %H:%M:%S")
+                if opened_at_ms else ""
+            )
+            writer.writerow([
+                datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                pos.get("entry_price", ""),
+                pos.get("qty", ""),
+                pos.get("leverage", ""),
+                f"{pnl:.4f}",
+                pos.get("simulated", DRY_RUN),
+                reason,
+                opened_at_ist,
+            ])
+    except Exception as e:
+        print(f"  [trade history] failed to log closed trade for {symbol}: {e}")
+
+
 def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
     closed = []
     for symbol, pos in list(open_shorts.items()):
@@ -850,7 +917,7 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
                 continue
             if pos["tp_price"] is not None and last_price <= pos["tp_price"]:
                 pnl = (pos["entry_price"] - pos["tp_price"]) * pos["qty"]
-                closed.append((symbol, pnl))
+                closed.append((symbol, pnl, pos, "take_profit"))
         else:
             try:
                 live_positions = get_positions(symbol)
@@ -888,9 +955,9 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             except requests.HTTPError as e:
                 print(f"  [reconcile] {symbol}: P&L lookup failed ({e}), closing with unknown P&L.")
                 pnl = 0.0
-            closed.append((symbol, pnl))
+            closed.append((symbol, pnl, pos, "exchange_closed"))
 
-    for symbol, pnl in closed:
+    for symbol, pnl, pos, reason in closed:
         del open_shorts[symbol]
         daily_trade_tracker["realized_pnl_usdt"] += pnl
         daily_trade_tracker["trades_closed"] += 1
@@ -898,6 +965,7 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             daily_trade_tracker["wins"] += 1
         else:
             daily_trade_tracker["losses"] += 1
+        record_trade_close(symbol, pos, pnl, reason)
         print(f"  [reconcile] {symbol}: position closed. P&L {pnl:+.2f} USDT.")
         send_telegram_message(
             f"{'[DRY RUN] ' if DRY_RUN else ''}{symbol} position closed. P&L: {pnl:+.2f} USDT"
@@ -1041,6 +1109,9 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
         print(f"  [status update] wallet balance lookup failed: {e}")
         msg += "\n\n💰 Wallet balance: unavailable this cycle"
 
+    if bot_paused.is_set():
+        msg += "\n\n⏸ New entries paused (/resume to re-enable)"
+
     print(f"\n[status update] {msg}")
     send_telegram_message(msg, reply_markup={"inline_keyboard": keyboard_rows} if keyboard_rows else None)
 
@@ -1120,6 +1191,7 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
         daily_trade_tracker["wins"] += 1
     else:
         daily_trade_tracker["losses"] += 1
+    record_trade_close(symbol, pos, pnl, "manual_telegram")
     save_state(open_shorts, daily_trade_tracker)
 
     send_telegram_message(
@@ -1141,6 +1213,43 @@ def send_on_demand_status(open_shorts, daily_trade_tracker):
     send_position_status_update(open_shorts, tickers, force_send=True)
 
 
+def send_trade_history():
+    """Handles the /history command — a quick text summary of closed trades
+    (win/loss count, all-time realized P&L, last 10) plus the full CSV as a
+    downloadable attachment. Doesn't touch open_shorts/daily_trade_tracker,
+    only the CSV file, so it's safe to call without state_lock."""
+    if not os.path.exists(TRADE_HISTORY_FILE_PATH):
+        send_telegram_message("No trades closed yet — history is empty.")
+        return
+    try:
+        with open(TRADE_HISTORY_FILE_PATH, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        send_telegram_message(f"⚠️ Couldn't read trade history: {e}")
+        return
+
+    if not rows:
+        send_telegram_message("No trades closed yet — history is empty.")
+        return
+
+    total_pnl = sum(float(r["pnl_usdt"]) for r in rows if r.get("pnl_usdt"))
+    wins = sum(1 for r in rows if float(r.get("pnl_usdt", 0)) >= 0)
+    losses = len(rows) - wins
+    recent = rows[-10:]
+    lines = [
+        f"{'🟢' if float(r['pnl_usdt']) >= 0 else '🔴'} {r['closed_at_ist']}  {r['symbol']}  "
+        f"{float(r['pnl_usdt']):+.2f} USDT ({r['reason']}{', DRY RUN' if r.get('simulated') == 'True' else ''})"
+        for r in recent
+    ]
+    msg = (
+        f"📜 Trade history — {len(rows)} closed trade(s) total\n"
+        f"Win/Loss: {wins}/{losses}  |  All-time realized P&L: {total_pnl:+.2f} USDT\n\n"
+        f"Last {len(recent)}:\n" + "\n".join(lines)
+    )
+    send_telegram_message(msg)
+    send_telegram_document(TRADE_HISTORY_FILE_PATH, caption="Full trade history (CSV)")
+
+
 def telegram_polling_loop(open_shorts, daily_trade_tracker):
     """Runs for the lifetime of the process on its own daemon thread, separate
     from main()'s 5-minute scan loop — this is what lets tapping "❌ Close" in
@@ -1155,7 +1264,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         print("  [telegram] button/command polling disabled (notifications off or token/chat id not set).")
         return
 
-    print("  [telegram] listening for 'Close' button taps and /status commands...")
+    print("  [telegram] listening for 'Close' taps and /status, /history, /pause, /resume commands...")
     offset = None
     while True:
         try:
@@ -1184,6 +1293,30 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         except Exception as e:
                             print(f"  [telegram] /status failed unexpectedly: {e}")
                             send_telegram_message(f"⚠️ /status failed unexpectedly: {e}")
+                elif text == "/history":
+                    print("  [telegram] /history requested")
+                    try:
+                        send_trade_history()
+                    except Exception as e:
+                        print(f"  [telegram] /history failed unexpectedly: {e}")
+                        send_telegram_message(f"⚠️ /history failed unexpectedly: {e}")
+                elif text == "/pause":
+                    if bot_paused.is_set():
+                        send_telegram_message("⏸ Already paused — no new trades are being opened.")
+                    else:
+                        bot_paused.set()
+                        print("  [telegram] /pause — new entries suspended")
+                        send_telegram_message(
+                            "⏸ Paused. No new trades will be opened until you send /resume.\n"
+                            "Existing open positions are still monitored, and 'Close' buttons still work."
+                        )
+                elif text == "/resume":
+                    if not bot_paused.is_set():
+                        send_telegram_message("▶️ Already running — not paused.")
+                    else:
+                        bot_paused.clear()
+                        print("  [telegram] /resume — new entries re-enabled")
+                        send_telegram_message("▶️ Resumed. Scanning for new entries again.")
                 continue
 
             cq = update.get("callback_query")
@@ -1305,6 +1438,16 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
           f"{len(candidates)} symbol(s) pass the market-cap/drop/volume filter. "
           f"Trades today: {daily_trade_tracker['count']}/{MAX_TRADES_PER_DAY}")
+
+    if bot_paused.is_set():
+        # Paused via /pause — skip opening new trades entirely this cycle,
+        # but everything above (reconcile, liquidation checks, status
+        # updates, daily rollover) still ran normally, and manual closes via
+        # Telegram still work independently on their own thread.
+        if candidates:
+            print(f"  [paused] {len(candidates)} candidate(s) passed screening but the bot is "
+                  f"paused (/resume to re-enable) — skipping new entries.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
 
     for cand in candidates:
         symbol = cand["symbol"]
@@ -1486,7 +1629,8 @@ def main():
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
         f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day.\n"
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
-        f"Send /status any time for an on-demand snapshot."
+        f"Send /status any time for an on-demand snapshot, /history for closed trades, "
+        f"/pause to stop new entries, /resume to re-enable them."
     )
 
     # Runs the whole time the process is up, independent of the 5-minute scan
