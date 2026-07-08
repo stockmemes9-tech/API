@@ -149,8 +149,10 @@ DESIRED_LEVERAGE = 5                  # target leverage; if a symbol's max_lever
 # computed per-trade in run_once() rather than as a single constant here.
 TP_CAPITAL_PCT = 5.0                  # target: 5% profit on the 15k capital
 
-MAX_CONCURRENT_SHORTS = 3             # simple in-memory cap on open positions this run
 MAX_TRADES_PER_DAY = 10               # hard cap on new entries per calendar day (resets at midnight IST)
+                                       # No cap on concurrent open positions — the bot will keep as many
+                                       # open at once as the daily trade count and available wallet
+                                       # balance allow.
 
 POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
 
@@ -343,6 +345,24 @@ def get_realized_pnl(symbol, from_time_ms):
         except (KeyError, ValueError, TypeError):
             print(f"  [reconcile] {symbol}: transaction entry missing/bad 'amount' field, skipping it. Raw: {t}")
     return total
+
+
+def get_wallet_balance():
+    """Returns the available USDT futures wallet balance (float) — the amount
+    free to use for new orders/margin, per CoinSwitch's Get Wallet Balance
+    endpoint. Raises requests.HTTPError on failure (caller decides how to
+    handle a transient lookup failure)."""
+    headers, path = sign_request("GET", "/trade/api/v2/futures/wallet_balance")
+    r = requests.get(BASE_URL + path, headers=headers, timeout=15)
+    r.raise_for_status()
+    base_asset_balances = r.json()["data"]["base_asset_balances"]
+    for entry in base_asset_balances:
+        if entry.get("base_asset") == "USDT":
+            return float(entry["balances"]["total_available_balance"])
+    # No USDT row at all — treat as zero available rather than raising, so a
+    # single unexpected response shape doesn't crash the whole scan cycle.
+    print(f"  [wallet] no USDT entry found in wallet balance response: {base_asset_balances}")
+    return 0.0
 
 
 def get_instrument_info():
@@ -756,9 +776,10 @@ def recover_open_positions(instruments, daily_trade_tracker):
 
 # ------------------------------ Position reconciliation --------------------------
 #
-# THE BUG THAT CAUSED THE FREEZE: the old version only ever added symbols to
+# THE BUG THAT CAUSED THE FREEZE (historical — back when there was a
+# concurrent-position cap): the old version only ever added symbols to
 # open_shorts (in place_order's call site) and never removed them, so once
-# MAX_CONCURRENT_SHORTS entries had fired, every future cycle hit "Max
+# the cap's worth of entries had fired, every future cycle hit "Max
 # concurrent shorts reached" forever — even though nothing was actually still
 # open. This function is what's missing: on each cycle, check whether every
 # tracked short has actually closed, and if so, drop it from open_shorts and
@@ -809,8 +830,8 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             # returned for the symbol should mean nothing is open. If the
             # list is non-empty, we do NOT assume it's closed just because a
             # "status" field looks unfamiliar — better to leave a real
-            # position tracked (and miss a MAX_CONCURRENT_SHORTS slot) than
-            # to silently drop tracking of something still open. Watch the
+            # position tracked than to silently drop tracking of something
+            # still open. Watch the
             # first day of live logs closely and confirm this behaves as
             # expected before trusting it unattended.
             if len(live_positions) > 0:
@@ -1025,6 +1046,24 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # Fixed 15,000 INR margin per trade, converted to USDT at the live rate.
     order_margin_usdt = CAPITAL_INR / usdt_inr_rate
 
+    # Check available USDT balance before doing any real work this cycle.
+    # If there isn't enough free margin for even one trade, there's no point
+    # scanning/evaluating candidates at all this cycle — just wait for the
+    # wallet to be topped up (or for a position to close and free margin)
+    # and try again next cycle. DRY_RUN still checks this against the real
+    # account so paper-trading behaves the same way live trading would.
+    try:
+        available_balance_usdt = get_wallet_balance()
+    except requests.HTTPError as e:
+        print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+
+    if available_balance_usdt < order_margin_usdt:
+        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
+              f"{order_margin_usdt:.2f} USDT needed for one trade — not searching for new trades "
+              f"this cycle. Existing open positions are unaffected.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+
     # Reset the daily counters if the calendar day has rolled over (IST).
     # Send yesterday's P&L summary to Telegram before wiping the numbers.
     if daily_trade_tracker["date"] != today:
@@ -1048,8 +1087,15 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         if daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
             print("  Daily trade limit reached, no further entries until tomorrow.")
             break
-        if len(open_shorts) >= MAX_CONCURRENT_SHORTS:
-            print("  Max concurrent shorts reached, skipping further entries this cycle.")
+        # No cap on how many positions can be open at once — the only limits
+        # are the daily trade count above and the wallet balance below.
+        # available_balance_usdt is decremented locally (not re-fetched) as
+        # each trade in this cycle consumes margin, so a burst of candidates
+        # in one cycle can't collectively overdraw the wallet.
+        if available_balance_usdt < order_margin_usdt:
+            print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is now below "
+                  f"the {order_margin_usdt:.2f} USDT needed for another trade — stopping new "
+                  f"entries for this cycle.")
             break
 
         time.sleep(2.1)  # KLines is rate-limited to 30 req/60s per CoinSwitch's docs
@@ -1114,6 +1160,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
                   f"(partial fill) — sizing take-profit off the filled amount.")
+        # Only deduct the margin actually used (scaled to what filled) from the
+        # locally-tracked balance, so this cycle's remaining-balance check
+        # reflects the real free margin left, not the fully-requested amount.
+        available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
         qty = filled_qty
 
         entry_msg = (
