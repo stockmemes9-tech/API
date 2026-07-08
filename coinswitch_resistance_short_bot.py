@@ -94,6 +94,20 @@ state_lock = threading.Lock()
 # positions, you just won't get new entries.
 bot_paused = threading.Event()
 
+# Tracks consecutive price-fetch failures across BOTH the 5-minute scan loop
+# (run_once) and the fast price_monitor_loop thread, since they hit the same
+# underlying CoinSwitch endpoint and a real outage will show up in both. Also
+# doubles as the "last known good" timestamp the heartbeat reports on. See
+# record_fetch_success()/record_fetch_failure().
+connectivity_lock = threading.Lock()
+connectivity_state = {
+    "consecutive_failures": 0,
+    "alert_sent": False,
+    "last_success_ms": None,
+    "first_failure_ms": None,
+    "last_error": None,
+}
+
 # All "day" boundaries (daily trade cap, daily P&L summary) are computed in
 # IST, since that's the trader's timezone — Railway's container clock is UTC
 # and we don't want the day to roll over at 5:30am IST.
@@ -220,6 +234,11 @@ PRICE_MONITOR_INTERVAL_SECONDS = 30        # how often the dedicated fast-monito
                                             # from the 5-minute scan cycle) re-checks open positions'
                                             # live prices for the loss/liquidation alerts above — see
                                             # price_monitor_loop().
+CONNECTIVITY_ALERT_THRESHOLD = 3           # consecutive price-fetch failures (across the scan loop
+                                            # AND the fast monitor combined) before sending a "we're
+                                            # flying blind" Telegram alert — see record_fetch_failure().
+HEARTBEAT_INTERVAL_SECONDS = 60 * 60       # how often heartbeat_loop() sends a "still alive" ping,
+                                            # independent of the daily summary and any other alert.
 
 # --- Telegram notifications ---
 # 1. Message @BotFather on Telegram, send /newbot, follow the prompts -> you get a bot token.
@@ -346,6 +365,66 @@ def send_telegram_document(file_path, caption=""):
             )
     except Exception as e:
         print(f"  [telegram] failed to send document: {e}")
+
+
+# ------------------------------ Connectivity health ---------------------------
+
+def format_duration(seconds):
+    """Human-readable duration for heartbeat/connectivity messages, e.g. '2h 14m' or '43s'."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def record_fetch_success():
+    """Call after any successful get_all_tickers() call. Resets the failure
+    streak and, if an outage alert had been sent, sends a matching recovery
+    alert so you know the moment it clears rather than having to infer it
+    from alerts simply stopping."""
+    with connectivity_lock:
+        now_ms = int(time.time() * 1000)
+        connectivity_state["last_success_ms"] = now_ms
+        if connectivity_state["alert_sent"]:
+            down_seconds = (now_ms - connectivity_state["first_failure_ms"]) / 1000
+            failures = connectivity_state["consecutive_failures"]
+            send_telegram_message(
+                f"🟢 API connectivity restored — price fetches succeeding again "
+                f"after {failures} consecutive failures over ~{format_duration(down_seconds)}."
+            )
+        connectivity_state["consecutive_failures"] = 0
+        connectivity_state["alert_sent"] = False
+        connectivity_state["first_failure_ms"] = None
+        connectivity_state["last_error"] = None
+
+
+def record_fetch_failure(source, error):
+    """Call after any failed get_all_tickers() call, from either the scan
+    loop or the fast price monitor. Once CONNECTIVITY_ALERT_THRESHOLD
+    consecutive failures pile up (across both callers combined — they hit
+    the same endpoint) sends a single alert, not one per failure, so a rough
+    patch of network flakiness doesn't spam the chat."""
+    with connectivity_lock:
+        connectivity_state["consecutive_failures"] += 1
+        connectivity_state["last_error"] = str(error)
+        if connectivity_state["first_failure_ms"] is None:
+            connectivity_state["first_failure_ms"] = int(time.time() * 1000)
+        if (connectivity_state["consecutive_failures"] >= CONNECTIVITY_ALERT_THRESHOLD
+                and not connectivity_state["alert_sent"]):
+            send_telegram_message(
+                f"🔴 API connectivity issue: {connectivity_state['consecutive_failures']} "
+                f"consecutive price-fetch failures (most recently from {source}).\n"
+                f"Last error: {connectivity_state['last_error']}\n"
+                f"Loss/liquidation alerts and new entries may be delayed or skipped until this clears."
+            )
+            connectivity_state["alert_sent"] = True
 
 
 # ------------------------------ Market cap -----------------------------------
@@ -1745,7 +1824,9 @@ def price_monitor_loop(open_shorts, daily_trade_tracker):
             tickers = get_all_tickers()
         except Exception as e:
             print(f"  [price monitor] failed to fetch tickers ({e}), will retry next tick.")
+            record_fetch_failure("price monitor", e)
             continue
+        record_fetch_success()
 
         with state_lock:
             changed = False
@@ -1757,11 +1838,67 @@ def price_monitor_loop(open_shorts, daily_trade_tracker):
                 save_state(open_shorts, daily_trade_tracker)
 
 
+def heartbeat_loop(open_shorts):
+    """Background thread, independent of every other alert in this file,
+    that sends a plain "still alive" ping every HEARTBEAT_INTERVAL_SECONDS.
+    The daily summary and the connectivity alert both only fire under
+    specific conditions — this is the one message that proves the process
+    itself hasn't silently died (crashed thread, container stuck, etc.)
+    even when nothing noteworthy has happened.
+
+    Also surfaces the connectivity state's last-known-good timestamp, so a
+    "the process is up but price fetches have been failing for 40 minutes"
+    situation is visible here too, not just at the moment the connectivity
+    alert first fired."""
+    start_ms = int(time.time() * 1000)
+    print(f"  [heartbeat] sending a keep-alive ping every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.")
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        now_ms = int(time.time() * 1000)
+        uptime = format_duration((now_ms - start_ms) / 1000)
+
+        with connectivity_lock:
+            last_success_ms = connectivity_state["last_success_ms"]
+            consecutive_failures = connectivity_state["consecutive_failures"]
+
+        if last_success_ms is None:
+            price_line = "no successful price fetch yet this run"
+        else:
+            age_seconds = (now_ms - last_success_ms) / 1000
+            # Anything older than a couple of full monitor/scan cycles is
+            # worth flagging even if the failure count hasn't crossed the
+            # connectivity-alert threshold yet.
+            stale = age_seconds > 2 * max(POLL_INTERVAL_SECONDS, PRICE_MONITOR_INTERVAL_SECONDS)
+            price_line = f"last successful price fetch {format_duration(age_seconds)} ago"
+            if stale:
+                price_line += " ⚠️ STALE"
+
+        with state_lock:
+            open_count = len(open_shorts)
+
+        msg = (
+            f"💓 Heartbeat — bot alive, uptime {uptime}.\n"
+            f"Open positions: {open_count}  |  {price_line}"
+        )
+        if consecutive_failures:
+            msg += f"\n⚠️ {consecutive_failures} consecutive price-fetch failures in progress right now."
+        if bot_paused.is_set():
+            msg += "\n⏸ New entries paused (/resume to re-enable)"
+
+        print(f"\n[heartbeat] {msg}")
+        send_telegram_message(msg)
+
+
 # ------------------------------ Main loop ---------------------------------------
 
 def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
              last_market_refresh_date, last_status_update_ms):
-    tickers = get_all_tickers()
+    try:
+        tickers = get_all_tickers()
+    except Exception as e:
+        record_fetch_failure("scan cycle", e)
+        raise
+    record_fetch_success()
     # Everything in this block reads and/or mutates open_shorts /
     # daily_trade_tracker, the same state telegram_polling_loop() touches the
     # instant a "Close" button is tapped — held under state_lock so a manual
@@ -2078,7 +2215,8 @@ def main():
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
         f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day. "
-        f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s.\n"
+        f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s. "
+        f"Heartbeat every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.\n"
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
         f"Send /status any time for an on-demand snapshot, /history for closed trades, "
         f"/analytics for win rate/profit factor/drawdown stats, "
@@ -2103,6 +2241,13 @@ def main():
         target=price_monitor_loop, args=(open_shorts, daily_trade_tracker), daemon=True
     )
     price_monitor_thread.start()
+
+    # Plain keep-alive ping, independent of everything else — see
+    # heartbeat_loop()'s docstring.
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop, args=(open_shorts,), daemon=True
+    )
+    heartbeat_thread.start()
 
     while True:
         try:
