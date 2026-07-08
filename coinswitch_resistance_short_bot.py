@@ -212,6 +212,10 @@ LIQUIDATION_WARNING_PCT = 50.0             # alert once a position's adverse mov
                                             # % of the distance from entry to its estimated liquidation
                                             # price (see estimate_liquidation_price() for the caveats
                                             # on how that estimate is derived).
+LOSS_ALERT_PCT = 10.0                      # alert once a position's unrealized loss (as a % of the
+                                            # margin actually put up for that trade, i.e. price move %
+                                            # times leverage) reaches this. Independent of, and usually
+                                            # fires well before, LIQUIDATION_WARNING_PCT.
 
 # --- Telegram notifications ---
 # 1. Message @BotFather on Telegram, send /newbot, follow the prompts -> you get a bot token.
@@ -1192,6 +1196,65 @@ def check_liquidation_warnings(open_shorts, tickers):
     return changed
 
 
+def check_loss_warnings(open_shorts, tickers):
+    """Sends a one-time Telegram alert per position the first cycle its
+    unrealized loss reaches LOSS_ALERT_PCT of the margin put up for that
+    trade (i.e. price-move % against the position, times leverage — how much
+    of the capital actually risked on this trade is currently under water).
+    Mirrors check_liquidation_warnings()'s re-arm behaviour: if the position
+    recovers back under the threshold it clears the flag, so a position that
+    dips past -10%, recovers, and dips again later gets alerted both times
+    instead of going silent for the rest of its life."""
+    changed = False
+    for symbol, pos in open_shorts.items():
+        entry_price = pos.get("entry_price")
+        qty = pos.get("qty")
+        leverage = pos.get("leverage")
+        if entry_price is None or qty is None or not leverage:
+            continue  # can't compute a margin-relative loss % without all three
+
+        t = tickers.get(symbol)
+        if t is None:
+            continue
+        try:
+            current_price = float(t["last_price"])
+        except (KeyError, ValueError):
+            continue
+
+        # SHORT: profit when price falls, loss when price rises above entry.
+        unrealized = (entry_price - current_price) * qty
+        if unrealized >= 0:
+            # In profit (or flat) — make sure the flag is re-armed and move on.
+            if pos.get("loss_warning_sent", False):
+                pos["loss_warning_sent"] = False
+                changed = True
+            continue
+
+        margin = (entry_price * qty) / leverage
+        if margin <= 0:
+            continue
+        loss_pct = -unrealized / margin * 100  # positive number = % of margin lost
+
+        already_sent = pos.get("loss_warning_sent", False)
+        if loss_pct >= LOSS_ALERT_PCT:
+            if not already_sent:
+                print(f"  [loss alert] {symbol}: unrealized loss is {loss_pct:.1f}% of margin "
+                      f"({unrealized:+.2f} USDT) — sending warning.")
+                send_telegram_message(
+                    f"🔻 {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} short is down "
+                    f"{loss_pct:.1f}% of margin ({unrealized:+.2f} USDT).\n"
+                    f"Entry: {entry_price}  |  Current: {current_price}  |  Leverage: {leverage}x"
+                )
+                pos["loss_warning_sent"] = True
+                changed = True
+        elif already_sent:
+            # Recovered back above the threshold — re-arm so a future dip
+            # alerts again instead of staying permanently silenced.
+            pos["loss_warning_sent"] = False
+            changed = True
+    return changed
+
+
 def send_position_status_update(open_shorts, tickers, force_send=False):
     """Periodic (STATUS_UPDATE_INTERVAL_SECONDS) Telegram snapshot of every
     open position's current unrealized P&L, plus the free wallet balance and
@@ -1667,6 +1730,13 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         # status timer) since an adverse move can cross the warning threshold
         # well before the next scheduled status update.
         if check_liquidation_warnings(open_shorts, tickers):
+            save_state(open_shorts, daily_trade_tracker)
+
+        # Same reasoning as the liquidation check above — a position can
+        # cross the loss threshold well before the next scheduled status
+        # update, so this also runs every cycle rather than on the 15-minute
+        # timer.
+        if check_loss_warnings(open_shorts, tickers):
             save_state(open_shorts, daily_trade_tracker)
 
         now_ms = int(time.time() * 1000)
