@@ -255,7 +255,7 @@ DESIRED_LEVERAGE = 5                  # target leverage; if a symbol's max_lever
 # computed per-trade in run_once() rather than as a single constant here.
 TP_CAPITAL_PCT = 5.0                  # target: 5% profit on the 15k capital
 
-MAX_TRADES_PER_DAY = 10               # hard cap on new entries per calendar day (resets at midnight IST)
+MAX_TRADES_PER_DAY = 25               # hard cap on new entries per calendar day (resets at midnight IST)
                                        # No cap on concurrent open positions — the bot will keep as many
                                        # open at once as the daily trade count and available wallet
                                        # balance allow.
