@@ -13,7 +13,7 @@ Strategy (as described by the user):
        but if volume can't be determined from the candle data (e.g. the field
        name doesn't match), this check is skipped rather than blocking the
        trade (see is_volume_declining()'s True/False/None logic).
-    5. The symbol hasn't already been shorted (real or DRY_RUN) in the last 24 hours.
+    5. The symbol hasn't already been shorted (real or DRY_RUN) in the last hour.
 
 This script:
     - Pulls the global top-100 market-cap list from CoinGecko (free, no key needed)
@@ -26,7 +26,7 @@ This script:
       is sitting just under one of them, requiring a rejection wick AND
       declining volume into the level (see is_volume_declining()) before
       treating it as confirmed.
-    - Skips any symbol that was already entered within the last 24 hours,
+    - Skips any symbol that was already entered within the last hour,
       even if it closed and re-qualifies again in the meantime (see
       ENTRY_COOLDOWN_HOURS / daily_trade_tracker["recent_entries"]).
     - If everything matches, places a MARKET short (no stop-loss order) and a
@@ -263,11 +263,12 @@ MAX_TRADES_PER_DAY = 10               # hard cap on new entries per calendar day
 # Rule: never open a NEW short on a symbol that was already entered (real or
 # DRY_RUN) within the last this-many hours — even if it closed in the
 # meantime and re-qualifies later the same cycle or a later one. This is a
-# rolling 24h window per symbol, NOT tied to the IST calendar day the way
+# rolling window per symbol, NOT tied to the IST calendar day the way
 # MAX_TRADES_PER_DAY is, so it survives a midnight rollover correctly (e.g.
-# a short opened at 23:50 IST still blocks re-entry into the next morning).
+# a short opened at 23:50 IST still blocks re-entry for 1h into the next
+# morning).
 # See daily_trade_tracker["recent_entries"] (symbol -> opened_at_ms) below.
-ENTRY_COOLDOWN_HOURS = 24
+ENTRY_COOLDOWN_HOURS = 1
 ENTRY_COOLDOWN_MS = ENTRY_COOLDOWN_HOURS * 60 * 60 * 1000
 
 POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
@@ -1033,15 +1034,15 @@ def recover_open_positions(instruments, daily_trade_tracker):
               f"P&L so far {daily_trade_tracker['realized_pnl_usdt']:+.2f} USDT.")
     elif state_daily_tracker:
         # Different calendar day — don't restore stale trade counts/P&L, but
-        # the 24h re-entry cooldown is a rolling window, not calendar-day
+        # the re-entry cooldown is a rolling window, not calendar-day
         # based, so it still needs to survive across the midnight rollover
         # (a symbol shorted at 23:50 IST yesterday should still be blocked
-        # from re-entry this morning, not get reset just because the date
-        # ticked over).
+        # from re-entry this morning if within the cooldown window, not get
+        # reset just because the date ticked over).
         daily_trade_tracker["recent_entries"] = state_daily_tracker.get("recent_entries") or {}
         print(f"  [state] saved state is from a previous day "
               f"({state_daily_tracker.get('date')}), not restoring today's counters "
-              f"(24h re-entry cooldown timestamps were still restored).")
+              f"(re-entry cooldown timestamps were still restored).")
     daily_trade_tracker.setdefault("recent_entries", {})
 
     # Simulated (DRY_RUN) shorts never touched the real exchange, so there's
@@ -1625,7 +1626,7 @@ def send_help_message():
         "/status — on-demand snapshot of every open position's unrealized P&L",
         "/history — closed-trade summary (win/loss, all-time P&L) + CSV file",
         "/analytics — win rate, avg win/loss, win/loss streak stats",
-        "/cooldowns — symbols currently blocked by the 24h re-entry rule",
+        f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
@@ -1650,7 +1651,7 @@ def send_on_demand_status(open_shorts, daily_trade_tracker):
 
 def send_cooldowns_status(daily_trade_tracker):
     """Handles the /cooldowns command — lists every symbol currently blocked
-    by the 24h re-entry rule (see ENTRY_COOLDOWN_HOURS and
+    by the re-entry rule (see ENTRY_COOLDOWN_HOURS and
     daily_trade_tracker["recent_entries"]) and how many hours remain until
     each is eligible for a new entry again. Caller MUST already hold
     state_lock, same as /status, since recent_entries is part of the shared
@@ -2307,9 +2308,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                                                          # don't re-send it every single cycle it stays past
                                                          # threshold — see check_liquidation_warnings().
             }
-            # Recorded for both real and DRY_RUN entries — the 24h no-re-entry
-            # rule is a screening/behavior decision, not an execution detail,
-            # so paper-trading runs should see the same cooldown live trading would.
+            # Recorded for both real and DRY_RUN entries — the no-re-entry
+            # rule (ENTRY_COOLDOWN_HOURS) is a screening/behavior decision,
+            # not an execution detail, so paper-trading runs should see the
+            # same cooldown live trading would.
             daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
             save_state(open_shorts, daily_trade_tracker)
 
@@ -2342,7 +2344,7 @@ def main():
         "losses": 0,
         "realized_pnl_usdt": 0.0,
         "recent_entries": {},     # symbol -> opened_at_ms of its most recent entry (real or DRY_RUN),
-                                   # used for the 24h no-re-entry cooldown. Rolling window, NOT reset
+                                   # used for the no-re-entry cooldown (ENTRY_COOLDOWN_HOURS). Rolling window, NOT reset
                                    # on the midnight-IST rollover below (see recover_open_positions()).
     }  # resets at midnight IST; a summary is sent to Telegram right before the reset.
        # May be overwritten below by recover_open_positions() if a same-day
@@ -2380,7 +2382,7 @@ def main():
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
         f"Send /status any time for an on-demand snapshot, /history for closed trades, "
         f"/analytics for win rate/profit factor/drawdown stats, "
-        f"/cooldowns to see symbols on the 24h re-entry cooldown, "
+        f"/cooldowns to see symbols on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown, "
         f"/debugvolume SYMBOL to inspect raw kline volume data, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
