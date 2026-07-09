@@ -79,6 +79,22 @@ def main():
     if not found:
         print("No USDT entry found in base_asset_balances -- futures wallet may have no USDT yet.")
 
+    print("\n--- Checking for an INR balance in the same wallet ---")
+    inr_found = False
+    for entry in base_asset_balances:
+        if entry.get("base_asset") == "INR":
+            inr_found = True
+            try:
+                available = float(entry["balances"]["total_available_balance"])
+                print(f"INR available balance: {available} INR")
+                print("(the bot converts this to its USDT equivalent at the live rate "
+                      "and adds it to the USDT balance above when checking available margin)")
+            except (KeyError, ValueError, TypeError):
+                print(f"Found an INR entry but couldn't read total_available_balance. Raw: {entry}")
+            break
+    if not inr_found:
+        print("No INR entry found in base_asset_balances.")
+
 
 if __name__ == "__main__":
     main()

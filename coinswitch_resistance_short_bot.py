@@ -611,13 +611,28 @@ def get_realized_pnl(symbol, from_time_ms):
     return total
 
 
-def get_wallet_balance(max_retries=2, retry_delay_seconds=2.0):
-    """Returns the available USDT futures wallet balance (float) — the amount
-    free to use for new orders/margin, per CoinSwitch's Get Wallet Balance
-    endpoint. Raises requests.HTTPError on failure (caller decides how to
-    handle a transient lookup failure). GET is idempotent, so — same
-    reasoning as get_all_tickers() — this retries on both 429 and transient
-    network errors, not just rate limiting."""
+def get_wallet_balance(usdt_inr_rate=None, max_retries=2, retry_delay_seconds=2.0):
+    """Returns the available futures wallet balance (float, in USDT terms) —
+    the amount free to use for new orders/margin, per CoinSwitch's Get
+    Wallet Balance endpoint.
+
+    CoinSwitch's futures wallet can hold BOTH a USDT balance and an INR
+    balance under the same account (base_asset_balances returns one row per
+    asset) — so money sitting as INR that hasn't been converted to USDT is
+    just as usable for margin as USDT is. This adds both together, treating
+    INR as USDT at the current live rate, so the bot doesn't sit idle (or
+    wrongly report a zero balance) just because your funds happen to be
+    parked as INR rather than USDT.
+
+    usdt_inr_rate: pass the already-fetched live rate to avoid an extra
+    network call; if omitted (e.g. called from a context that doesn't have
+    it handy) this fetches it itself. If that fetch fails, the INR portion
+    is skipped (with a warning) rather than failing the whole balance check.
+
+    Raises requests.HTTPError on failure of the wallet call itself (caller
+    decides how to handle a transient lookup failure). GET is idempotent,
+    so — same reasoning as get_all_tickers() — this retries on both 429 and
+    transient network errors, not just rate limiting."""
     headers, path = sign_request("GET", "/trade/api/v2/futures/wallet_balance")
     for attempt in range(max_retries + 1):
         try:
@@ -636,13 +651,44 @@ def get_wallet_balance(max_retries=2, retry_delay_seconds=2.0):
             continue
         r.raise_for_status()
         base_asset_balances = r.json()["data"]["base_asset_balances"]
+
+        usdt_available = 0.0
+        inr_available = 0.0
+        found_any = False
         for entry in base_asset_balances:
-            if entry.get("base_asset") == "USDT":
-                return float(entry["balances"]["total_available_balance"])
-        # No USDT row at all — treat as zero available rather than raising, so a
-        # single unexpected response shape doesn't crash the whole scan cycle.
-        print(f"  [wallet] no USDT entry found in wallet balance response: {base_asset_balances}")
-        return 0.0
+            asset = entry.get("base_asset")
+            if asset == "USDT":
+                found_any = True
+                usdt_available = float(entry["balances"]["total_available_balance"])
+            elif asset == "INR":
+                found_any = True
+                inr_available = float(entry["balances"]["total_available_balance"])
+
+        if not found_any:
+            # No USDT or INR row at all — treat as zero available rather than
+            # raising, so a single unexpected response shape doesn't crash
+            # the whole scan cycle.
+            print(f"  [wallet] no USDT or INR entry found in wallet balance response: {base_asset_balances}")
+            return 0.0
+
+        inr_as_usdt = 0.0
+        if inr_available > 0:
+            rate = usdt_inr_rate
+            if rate is None:
+                try:
+                    rate = get_usdt_inr_rate()
+                except Exception as e:
+                    print(f"  [wallet] have {inr_available:.2f} INR available but couldn't fetch "
+                          f"USDT/INR rate to convert it ({e}) — counting only the USDT balance this cycle.")
+                    rate = None
+            if rate:
+                inr_as_usdt = inr_available / rate
+
+        total = usdt_available + inr_as_usdt
+        if inr_available > 0:
+            print(f"  [wallet] {usdt_available:.2f} USDT + {inr_available:.2f} INR "
+                  f"(~{inr_as_usdt:.2f} USDT) = {total:.2f} USDT available.")
+        return total
 
 
 def get_instrument_info():
@@ -2105,15 +2151,16 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # Fixed 15,000 INR margin per trade, converted to USDT at the live rate.
     order_margin_usdt = CAPITAL_INR / usdt_inr_rate
 
-    # Check available USDT balance before doing any real work this cycle.
-    # If there isn't enough free margin for even one trade, there's no point
-    # scanning/evaluating candidates at all this cycle — just wait for the
-    # wallet to be topped up (or for a position to close and free margin)
-    # and try again next cycle. This gate is skipped entirely when DRY_RUN
-    # is on, so paper-trading can keep scanning/simulating regardless of the
-    # real account balance. It's still enforced for live trading.
+    # Check available balance (USDT + INR, combined at the live rate) before
+    # doing any real work this cycle. If there isn't enough free margin for
+    # even one trade, there's no point scanning/evaluating candidates at all
+    # this cycle — just wait for the wallet to be topped up (or for a
+    # position to close and free margin) and try again next cycle. This
+    # gate is skipped entirely when DRY_RUN is on, so paper-trading can keep
+    # scanning/simulating regardless of the real account balance. It's
+    # still enforced for live trading.
     try:
-        available_balance_usdt = get_wallet_balance()
+        available_balance_usdt = get_wallet_balance(usdt_inr_rate)
     except requests.HTTPError as e:
         print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
