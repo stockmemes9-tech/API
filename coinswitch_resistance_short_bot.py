@@ -239,7 +239,7 @@ VOLUME_DECLINE_MIN_PCT = 15.0         # 2nd half of that window must average at 
                                        # (a tiny/noisy dip shouldn't be enough to pass the filter)
 
 # --- Order sizing / risk ---
-CAPITAL_INR = 15_000                  # fixed margin per trade, in INR (converted to USDT at runtime)
+CAPITAL_INR = 10_000                  # fixed margin per trade, in INR (converted to USDT at runtime)
 DESIRED_LEVERAGE = 5                  # target leverage; if a symbol's max_leverage is lower,
                                        # resolve_leverage() falls back to that symbol's highest
                                        # available leverage instead of failing the order.
@@ -1986,7 +1986,7 @@ def send_fees_summary():
     send_telegram_message(msg)
 
 
-
+def telegram_polling_loop(open_shorts, daily_trade_tracker):
     """Runs for the lifetime of the process on its own daemon thread, separate
     from main()'s 5-minute scan loop — this is what lets tapping "❌ Close" in
     Telegram close a position within a second or two instead of waiting for
@@ -2276,19 +2276,18 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             print(f"  [refresh] failed to refresh market cap list / USDT-INR rate ({e}), "
                   f"keeping previous values for this cycle.")
 
-    candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
-
-    # Fixed 15,000 INR margin per trade, converted to USDT at the live rate.
+    # Fixed CAPITAL_INR margin per trade, converted to USDT at the live rate.
     order_margin_usdt = CAPITAL_INR / usdt_inr_rate
 
-    # Check available balance (USDT + INR, combined at the live rate) before
-    # doing any real work this cycle. If there isn't enough free margin for
-    # even one trade, there's no point scanning/evaluating candidates at all
-    # this cycle — just wait for the wallet to be topped up (or for a
-    # position to close and free margin) and try again next cycle. This
-    # gate is skipped entirely when DRY_RUN is on, so paper-trading can keep
-    # scanning/simulating regardless of the real account balance. It's
-    # still enforced for live trading.
+    # Check available balance (USDT + INR, combined at the live rate) BEFORE
+    # doing any real work this cycle — including screening candidates. If
+    # there isn't enough free margin for even one trade, there's no point
+    # scanning the market at all this cycle: just wait for the wallet to be
+    # topped up (or for a position to close and free margin) and try again
+    # next cycle. This gate is skipped entirely when DRY_RUN is on, so
+    # paper-trading can keep scanning/simulating regardless of the real
+    # account balance — it's still enforced for live trading, where it now
+    # blocks both the search AND the trade, not just the trade.
     try:
         available_balance_usdt = get_wallet_balance(usdt_inr_rate)["total_usdt"]
     except requests.HTTPError as e:
@@ -2297,13 +2296,15 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     if not DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT needed for one trade — not searching for new trades "
-              f"this cycle. Existing open positions are unaffected.")
+              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"not scanning for new trades this cycle. Existing open positions are unaffected.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
     elif DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT needed for one trade — continuing to scan anyway "
-              f"since DRY_RUN is on (no real orders will be placed).")
+              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
+
+    candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
 
     # Reset the daily counters if the calendar day has rolled over (IST).
     # Send yesterday's P&L summary to Telegram before wiping the numbers.
