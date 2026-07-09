@@ -612,17 +612,22 @@ def get_realized_pnl(symbol, from_time_ms):
 
 
 def get_wallet_balance(usdt_inr_rate=None, max_retries=2, retry_delay_seconds=2.0):
-    """Returns the available futures wallet balance (float, in USDT terms) —
-    the amount free to use for new orders/margin, per CoinSwitch's Get
-    Wallet Balance endpoint.
+    """Returns the available futures wallet balance as a dict:
+        {"total_usdt": float, "usdt_available": float,
+         "inr_available": float, "inr_as_usdt": float}
+    per CoinSwitch's Get Wallet Balance endpoint. "total_usdt" is the amount
+    free to use for new orders/margin — callers that only care about the
+    total (e.g. the pre-trade balance gate) should use result["total_usdt"];
+    callers that want to show the breakdown (e.g. the Telegram status
+    message) have the individual pieces too.
 
     CoinSwitch's futures wallet can hold BOTH a USDT balance and an INR
     balance under the same account (base_asset_balances returns one row per
     asset) — so money sitting as INR that hasn't been converted to USDT is
-    just as usable for margin as USDT is. This adds both together, treating
-    INR as USDT at the current live rate, so the bot doesn't sit idle (or
-    wrongly report a zero balance) just because your funds happen to be
-    parked as INR rather than USDT.
+    just as usable for margin as USDT is. "total_usdt" adds both together,
+    treating INR as USDT at the current live rate, so the bot doesn't sit
+    idle (or wrongly report a zero balance) just because your funds happen
+    to be parked as INR rather than USDT.
 
     usdt_inr_rate: pass the already-fetched live rate to avoid an extra
     network call; if omitted (e.g. called from a context that doesn't have
@@ -669,7 +674,7 @@ def get_wallet_balance(usdt_inr_rate=None, max_retries=2, retry_delay_seconds=2.
             # raising, so a single unexpected response shape doesn't crash
             # the whole scan cycle.
             print(f"  [wallet] no USDT or INR entry found in wallet balance response: {base_asset_balances}")
-            return 0.0
+            return {"total_usdt": 0.0, "usdt_available": 0.0, "inr_available": 0.0, "inr_as_usdt": 0.0}
 
         inr_as_usdt = 0.0
         if inr_available > 0:
@@ -688,7 +693,12 @@ def get_wallet_balance(usdt_inr_rate=None, max_retries=2, retry_delay_seconds=2.
         if inr_available > 0:
             print(f"  [wallet] {usdt_available:.2f} USDT + {inr_available:.2f} INR "
                   f"(~{inr_as_usdt:.2f} USDT) = {total:.2f} USDT available.")
-        return total
+        return {
+            "total_usdt": total,
+            "usdt_available": usdt_available,
+            "inr_available": inr_available,
+            "inr_as_usdt": inr_as_usdt,
+        }
 
 
 def get_instrument_info():
@@ -1543,8 +1553,11 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
         msg = "No open positions right now."
 
     try:
-        wallet_balance = get_wallet_balance()
-        msg += f"\n\n💰 Wallet balance (free): {wallet_balance:.2f} USDT"
+        wallet = get_wallet_balance()
+        msg += f"\n\n💰 Wallet balance (free): {wallet['total_usdt']:.2f} USDT"
+        if wallet["inr_available"] > 0:
+            msg += (f"\n   ({wallet['usdt_available']:.2f} USDT + "
+                     f"{wallet['inr_available']:.2f} INR ≈ {wallet['inr_as_usdt']:.2f} USDT)")
     except Exception as e:
         print(f"  [status update] wallet balance lookup failed: {e}")
         msg += "\n\n💰 Wallet balance: unavailable this cycle"
@@ -2160,7 +2173,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # scanning/simulating regardless of the real account balance. It's
     # still enforced for live trading.
     try:
-        available_balance_usdt = get_wallet_balance(usdt_inr_rate)
+        available_balance_usdt = get_wallet_balance(usdt_inr_rate)["total_usdt"]
     except requests.HTTPError as e:
         print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
