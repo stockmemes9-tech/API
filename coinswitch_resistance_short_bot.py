@@ -611,6 +611,73 @@ def get_realized_pnl(symbol, from_time_ms):
     return total
 
 
+def get_account_transactions(from_time_ms=None, to_time_ms=None, limit=1000):
+    """Fetches every balance-affecting transaction on the futures account
+    (across all symbols) — trading fees (COMMISSION), funding payments
+    (FUNDING_FEE), realized P&L (P&L), liquidation fees (LIQUIDATION_FEE),
+    and margin top-ups (ADD_MARGIN) — per CoinSwitch's Get Transactions
+    endpoint. No 'type' filter is passed, so all of the above come back
+    together in one call; summarize_fees_and_pnl() below buckets them.
+
+    from_time_ms/to_time_ms omitted entirely means "no bound on that side" —
+    used for the /fees command's all-time totals."""
+    params = {"exchange": EXCHANGE, "limit": limit}
+    if from_time_ms is not None:
+        params["from_time"] = from_time_ms
+    if to_time_ms is not None:
+        params["to_time"] = to_time_ms
+    headers, path = sign_request("GET", "/trade/api/v2/futures/transactions", params)
+    r = requests.get(BASE_URL + path, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def summarize_fees_and_pnl(from_time_ms=None, to_time_ms=None):
+    """Buckets get_account_transactions() by type and returns:
+        {"gross_pnl", "commission", "funding_fee", "liquidation_fee", "net_pnl"}
+    all in USDT. commission/liquidation_fee come back negative (debits) per
+    CoinSwitch's signed-amount convention, so net_pnl = the straight sum of
+    all four — no separate subtraction needed. "Brokerage" in bot-speak
+    means commission specifically (the per-trade taker fee); funding and
+    liquidation fees are shown separately since they're a different thing
+    (funding can even be a credit, not a cost) and lumping them into
+    "brokerage" would be misleading.
+
+    Individual bad/missing entries are skipped with a warning rather than
+    raising, same as get_realized_pnl — one malformed row shouldn't blow up
+    the whole /fees command."""
+    totals = {"COMMISSION": 0.0, "FUNDING_FEE": 0.0, "P&L": 0.0, "LIQUIDATION_FEE": 0.0}
+    for t in get_account_transactions(from_time_ms, to_time_ms):
+        try:
+            ttype = t["type"]
+            amount = float(t["amount"])
+        except (KeyError, ValueError, TypeError):
+            print(f"  [fees] transaction entry missing/bad type or amount, skipping it. Raw: {t}")
+            continue
+        if ttype in totals:
+            totals[ttype] += amount
+    gross_pnl = totals["P&L"]
+    commission = totals["COMMISSION"]
+    funding_fee = totals["FUNDING_FEE"]
+    liquidation_fee = totals["LIQUIDATION_FEE"]
+    return {
+        "gross_pnl": gross_pnl,
+        "commission": commission,
+        "funding_fee": funding_fee,
+        "liquidation_fee": liquidation_fee,
+        "net_pnl": gross_pnl + commission + funding_fee + liquidation_fee,
+    }
+
+
+def start_of_day_ist_ms(date_str):
+    """Converts a 'YYYY-MM-DD' IST calendar date (as produced by today_ist())
+    into that day's 00:00:00 IST instant, in Unix milliseconds — the
+    from_time_ms boundary /fees uses for "today"."""
+    y, m, d = (int(x) for x in date_str.split("-"))
+    dt = datetime.datetime(y, m, d, 0, 0, 0, tzinfo=IST)
+    return int(dt.timestamp() * 1000)
+
+
 def get_wallet_balance(usdt_inr_rate=None, max_retries=2, retry_delay_seconds=2.0):
     """Returns the available futures wallet balance as a dict:
         {"total_usdt": float, "usdt_available": float,
@@ -1572,12 +1639,24 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
 def send_daily_summary(daily_trade_tracker, open_shorts):
     pnl = daily_trade_tracker["realized_pnl_usdt"]
     emoji = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+
+    fees_line = ""
+    try:
+        fees = summarize_fees_and_pnl(from_time_ms=start_of_day_ist_ms(daily_trade_tracker["date"]))
+        fees_line = (
+            f"Brokerage paid: {-fees['commission']:.2f} USDT\n"
+            f"Net P&L after fees: {fees['net_pnl']:+.2f} USDT\n"
+        )
+    except Exception as e:
+        print(f"  [daily summary] couldn't fetch fee breakdown ({e}), omitting it from today's summary.")
+
     msg = (
         f"{emoji} {'[DRY RUN] ' if DRY_RUN else ''}Daily summary — {daily_trade_tracker['date']}\n"
         f"Trades opened: {daily_trade_tracker['count']}\n"
         f"Trades closed: {daily_trade_tracker['trades_closed']} "
         f"(W {daily_trade_tracker['wins']} / L {daily_trade_tracker['losses']})\n"
         f"Realized P&L: {pnl:+.2f} USDT\n"
+        f"{fees_line}"
         f"Still open (carrying into today): {len(open_shorts)}"
     )
     print(f"\n[daily summary] {msg}")
@@ -1685,6 +1764,7 @@ def send_help_message():
         "/status — on-demand snapshot of every open position's unrealized P&L",
         "/history — closed-trade summary (win/loss, all-time P&L) + CSV file",
         "/analytics — win rate, avg win/loss, win/loss streak stats",
+        "/fees — brokerage (commission), funding fees, and net P&L after fees (today + all-time)",
         f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/pause — stop opening new trades (existing positions still monitored)",
@@ -1876,7 +1956,37 @@ def send_trade_analytics():
     send_telegram_message(msg)
 
 
-def telegram_polling_loop(open_shorts, daily_trade_tracker):
+def send_fees_summary():
+    """Handles the /fees command — total brokerage (commission) paid, plus
+    funding fees and net P&L after all fees, for today (IST) and all-time.
+    Read-only against CoinSwitch's Get Transactions endpoint, so it's safe
+    to call without state_lock, same as /history and /analytics."""
+    try:
+        today = summarize_fees_and_pnl(from_time_ms=start_of_day_ist_ms(today_ist()))
+        all_time = summarize_fees_and_pnl()
+    except Exception as e:
+        send_telegram_message(f"⚠️ Couldn't fetch fee/transaction data: {e}")
+        return
+
+    def block(label, s):
+        return (
+            f"{label}\n"
+            f"  Gross P&L: {s['gross_pnl']:+.2f} USDT\n"
+            f"  Brokerage (commission): {-s['commission']:.2f} USDT\n"
+            f"  Funding fees: {s['funding_fee']:+.2f} USDT\n"
+            f"  Liquidation fees: {-s['liquidation_fee']:.2f} USDT\n"
+            f"  Net P&L after fees: {s['net_pnl']:+.2f} USDT"
+        )
+
+    msg = (
+        f"💸 Fees & net profit{' [DRY RUN — figures will be 0 or empty]' if DRY_RUN else ''}\n\n"
+        f"{block('Today (' + today_ist() + '):', today)}\n\n"
+        f"{block('All-time:', all_time)}"
+    )
+    send_telegram_message(msg)
+
+
+
     """Runs for the lifetime of the process on its own daemon thread, separate
     from main()'s 5-minute scan loop — this is what lets tapping "❌ Close" in
     Telegram close a position within a second or two instead of waiting for
@@ -1890,7 +2000,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         print("  [telegram] button/command polling disabled (notifications off or token/chat id not set).")
         return
 
-    print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, "
+    print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, /fees, "
           "/cooldowns, /debugvolume, /pause, /resume, /help commands...")
     offset = None
     while True:
@@ -1934,6 +2044,13 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                     except Exception as e:
                         print(f"  [telegram] /analytics failed unexpectedly: {e}")
                         send_telegram_message(f"⚠️ /analytics failed unexpectedly: {e}")
+                elif text == "/fees":
+                    print("  [telegram] /fees requested")
+                    try:
+                        send_fees_summary()
+                    except Exception as e:
+                        print(f"  [telegram] /fees failed unexpectedly: {e}")
+                        send_telegram_message(f"⚠️ /fees failed unexpectedly: {e}")
                 elif text == "/cooldowns":
                     print("  [telegram] /cooldowns requested")
                     with state_lock:
