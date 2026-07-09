@@ -7,12 +7,19 @@ Strategy (as described by the user):
     1. It is NOT in the top-100 cryptos by global market cap.
     2. It is down more than 5% in the last 24 hours.
     3. It has more than 10 crore (10,00,00,000) INR of trading volume in the last 24 hours.
-    4. On the 5-minute chart, price is currently sitting at a resistance level,
-       confirmed by a rejection candle. Declining volume into the level is
-       also checked and, when it can be read, must actually be declining —
-       but if volume can't be determined from the candle data (e.g. the field
-       name doesn't match), this check is skipped rather than blocking the
-       trade (see is_volume_declining()'s True/False/None logic).
+    4. EITHER of the following two independent signals (only one is needed,
+       they don't stack):
+         4a. On the 5-minute chart, price is currently sitting at a
+             resistance level, confirmed by a rejection candle. Declining
+             volume into the level is also checked and, when it can be read,
+             must actually be declining — but if volume can't be determined
+             from the candle data (e.g. the field name doesn't match), this
+             check is skipped rather than blocking the trade (see
+             is_volume_declining()'s True/False/None logic).
+         4b. On the 5-minute chart, RSI(14) is above 77 (see compute_rsi() /
+             RSI_OVERBOUGHT_SHORT_THRESHOLD). This path is checked entirely
+             on its own — it does NOT require the resistance/rejection-
+             candle/declining-volume check in 4a.
     5. The symbol hasn't already been shorted (real or DRY_RUN) in the last hour.
 
 This script:
@@ -237,6 +244,19 @@ VOLUME_DECLINE_LOOKBACK_CANDLES = 6   # ~30 minutes of 5m candles looked at for 
 VOLUME_DECLINE_MIN_PCT = 15.0         # 2nd half of that window must average at least this much
                                        # lower volume than the 1st half to count as "declining"
                                        # (a tiny/noisy dip shouldn't be enough to pass the filter)
+
+# --- RSI overbought short trigger (5m chart) ---
+# A SECOND, independent entry path alongside the resistance setup above. A
+# candidate that already passed rule 1-3 screening (not top-100, down >5% in
+# 24h, >10cr INR volume) is also shorted if its 5m-candle RSI is above the
+# threshold below — even if it never shows a confirmed resistance rejection.
+# Per your instruction: base screening still applies, but the
+# resistance/rejection-candle/declining-volume check is skipped entirely for
+# this path (see run_once(), where resistance and RSI are checked as two
+# separate ways to arrive at the same SHORT signal, not stacked together).
+RSI_SHORT_ENABLED = True
+RSI_PERIOD = 14                       # standard Wilder RSI lookback, in 5m candles
+RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest closed 5m candle triggers a short
 
 # --- Order sizing / risk ---
 CAPITAL_INR = 10_000                  # fixed margin per trade, in INR (converted to USDT at runtime)
@@ -939,8 +959,13 @@ def is_volume_declining(candles, lookback=VOLUME_DECLINE_LOOKBACK_CANDLES,
     return decline_pct >= min_decline_pct
 
 
-def evaluate_resistance(symbol, current_price):
-    candles = get_klines(symbol)
+def evaluate_resistance(symbol, current_price, candles=None):
+    """candles can be passed in (e.g. already fetched by the caller for the
+    RSI check below) to avoid a second, redundant get_klines() call for the
+    same symbol in the same scan cycle. If omitted, fetches them itself like
+    before."""
+    if candles is None:
+        candles = get_klines(symbol)
     if len(candles) < (2 * PIVOT_WING + 5):
         return None
     levels = find_resistance_levels(candles)
@@ -957,6 +982,48 @@ def evaluate_resistance(symbol, current_price):
         if is_volume_declining(candles) is False:
             return None
     return hit
+
+
+def compute_rsi(candles, period=RSI_PERIOD):
+    """Standard Wilder RSI off closed 5m candle closes. Returns the RSI value
+    (0-100) as of the most recent CLOSED candle, or None if there aren't
+    enough candles yet to compute a `period`-length RSI.
+
+    Uses the classic Wilder smoothing (first average = simple mean of the
+    first `period` gains/losses, every value after that is an exponential
+    smooth of the previous average), which is what "RSI" conventionally
+    refers to on most charting platforms — not a plain rolling average."""
+    closes = [float(c["c"]) for c in candles]
+    if len(closes) < period + 1:
+        return None
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def is_rsi_overbought_short_trigger(candles, threshold=RSI_OVERBOUGHT_SHORT_THRESHOLD, period=RSI_PERIOD):
+    """Rule 4b (independent of resistance/rejection/volume-decline — rule 4):
+    on the 5-minute chart, RSI(period) above `threshold` triggers a short on
+    its own. Returns (triggered: bool, rsi_value: float|None). rsi_value is
+    still returned when not triggered (or None) so callers can log/inspect
+    it either way."""
+    rsi_value = compute_rsi(candles, period)
+    if rsi_value is None:
+        return False, None
+    return rsi_value > threshold, rsi_value
 
 
 def send_volume_debug(symbol):
@@ -2374,32 +2441,51 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                           # 429-storm on scan cycles with several candidates.
 
         try:
-            resistance = evaluate_resistance(symbol, cand["last_price"])
+            candles = get_klines(symbol)
         except requests.HTTPError as e:
             print(f"  {symbol}: klines fetch failed ({e}), skipping.")
             continue
 
-        # Strict rule: never short unless price is confirmed sitting at a real
-        # 5m resistance level (and, if enabled, showing a rejection candle).
-        # evaluate_resistance() returns None for anything short of that, so no
-        # entry below this line ever fires without a resistance confirmation.
-        if resistance is None:
+        resistance = evaluate_resistance(symbol, cand["last_price"], candles=candles)
+
+        # Two INDEPENDENT ways to arrive at a SHORT signal for a symbol that
+        # already passed base screening (rules 1-3: not top-100, down >5% in
+        # 24h, >10cr INR volume):
+        #   (a) resistance path (rule 4) — confirmed sitting at a real 5m
+        #       resistance level, plus rejection candle / declining-volume
+        #       checks per REQUIRE_REJECTION_CANDLE / REQUIRE_DECLINING_VOLUME.
+        #   (b) RSI path (rule 4b) — 5m-candle RSI above
+        #       RSI_OVERBOUGHT_SHORT_THRESHOLD, checked on its own and
+        #       WITHOUT the resistance/rejection/volume-decline check. This
+        #       does not stack with (a): either one on its own is enough.
+        rsi_triggered, rsi_value = (False, None)
+        if RSI_SHORT_ENABLED:
+            rsi_triggered, rsi_value = is_rsi_overbought_short_trigger(candles)
+
+        if resistance is None and not rsi_triggered:
             continue
 
         confirmations = []
-        if REQUIRE_REJECTION_CANDLE:
-            confirmations.append("rejection candle")
-        if REQUIRE_DECLINING_VOLUME:
-            # Note: this only means the volume check didn't block the trade —
-            # it may have actually confirmed declining volume, or it may have
-            # been inconclusive (unreadable field / not enough candles) and
-            # been allowed through anyway. See is_volume_declining()'s True/
-            # False/None return and evaluate_resistance() for the exact logic.
-            confirmations.append("volume check passed")
+        if resistance is not None:
+            if REQUIRE_REJECTION_CANDLE:
+                confirmations.append("rejection candle")
+            if REQUIRE_DECLINING_VOLUME:
+                # Note: this only means the volume check didn't block the trade —
+                # it may have actually confirmed declining volume, or it may have
+                # been inconclusive (unreadable field / not enough candles) and
+                # been allowed through anyway. See is_volume_declining()'s True/
+                # False/None return and evaluate_resistance() for the exact logic.
+                confirmations.append("volume check passed")
+        if rsi_triggered:
+            confirmations.append(f"RSI {rsi_value:.1f} > {RSI_OVERBOUGHT_SHORT_THRESHOLD:g}")
+
+        signal_reason = (
+            f"resistance ~{resistance:.6g}" if resistance is not None else "RSI overbought (no resistance check)"
+        )
         print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
               f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
-              f"price {cand['last_price']} at resistance ~{resistance:.6g} "
-              f"(resistance-confirmed{' + ' + ' + '.join(confirmations) if confirmations else ''}) — SHORT signal")
+              f"price {cand['last_price']}, {signal_reason} "
+              f"({' + '.join(confirmations) if confirmations else 'no extra confirmations'}) — SHORT signal")
 
         instrument = instruments.get(symbol)
         if instrument is None:
@@ -2453,7 +2539,8 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             f"Qty: {qty}  |  Leverage: {leverage}x"
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
-            f"24h: {cand['pct_change_24h']:.2f}%  |  Resistance: ~{resistance:.6g}\n"
+            f"24h: {cand['pct_change_24h']:.2f}%  |  Signal: {signal_reason}"
+            f"{f' (RSI {rsi_value:.1f})' if rsi_triggered and resistance is not None else ''}\n"
             f"No stop-loss set on this position."
         )
         send_telegram_message(entry_msg)
