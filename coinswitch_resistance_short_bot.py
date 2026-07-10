@@ -258,6 +258,53 @@ RSI_SHORT_ENABLED = True
 RSI_PERIOD = 14                       # standard Wilder RSI lookback, in 5m candles
 RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest closed 5m candle triggers a short
 
+# ============================ STRATEGY 2 (RSI 80/20) ========================
+# A second, completely separate strategy. Only one strategy is ever ACTIVE
+# for opening NEW trades at a time (switchable live via the /strategy1 and
+# /strategy2 Telegram commands, see strategy_state below) — but positions
+# already open from either strategy keep being reconciled, monitored, and
+# can still be closed regardless of which strategy is currently active.
+# Strategy 1's own rules/thresholds above are completely untouched by any
+# of this.
+#
+# Strategy 2 rules:
+#   - Screening: ONLY "not in the top-100 by global market cap" (same list
+#     strategy 1 uses). No 24h-drop-%, and deliberately NO 24h-volume check
+#     (per instruction) — every non-top-100 CoinSwitch futures symbol is a
+#     candidate.
+#   - Entry, on the 5-minute chart:
+#       RSI(14) above STRATEGY2_RSI_OVERBOUGHT (80) -> SHORT
+#       RSI(14) below STRATEGY2_RSI_OVERSOLD (20)    -> LONG
+#   - Leverage: same DESIRED_LEVERAGE (5x) target as strategy 1, falling
+#     back to the highest leverage the symbol actually allows if 5x isn't
+#     available (reuses resolve_leverage(), unchanged).
+#   - Take-profit: STRATEGY2_TP_CAPITAL_PCT (1%) of the CAPITAL employed on
+#     that trade — i.e. 1% of the margin (CAPITAL_INR), NOT 1% of the
+#     leveraged notional value. Same "% on capital -> % price move" style of
+#     conversion as strategy 1's TP_CAPITAL_PCT, just a different number and
+#     usable in either direction (short: price down; long: price up).
+STRATEGY2_ENABLED = True
+STRATEGY2_RSI_OVERBOUGHT = 80.0       # RSI strictly above this on the 5m chart -> SHORT
+STRATEGY2_RSI_OVERSOLD = 20.0         # RSI strictly below this on the 5m chart -> LONG
+STRATEGY2_TP_CAPITAL_PCT = 1.0        # target: 1% profit on capital employed (not on leveraged notional)
+
+# Which strategy is currently allowed to open NEW trades: "1" or "2". Read
+# from env as the default on a fresh deploy, then overridable live via
+# /strategy1 /strategy2 in Telegram and persisted across restarts in the
+# state file (see save_state/load_state and strategy_state below) — the env
+# var only matters until the first Telegram switch or a saved state file is found.
+ACTIVE_STRATEGY_DEFAULT = os.environ.get("ACTIVE_STRATEGY", "1").strip()
+if ACTIVE_STRATEGY_DEFAULT not in ("1", "2"):
+    ACTIVE_STRATEGY_DEFAULT = "1"
+
+# Mutable "which strategy is active" holder, guarded by state_lock same as
+# open_shorts/daily_trade_tracker (telegram_polling_loop's /strategy1 and
+# /strategy2 handlers mutate this from a different thread than the scan
+# loop reads it from).
+strategy_state = {"active": ACTIVE_STRATEGY_DEFAULT}
+
+# =============================================================================
+
 # --- Order sizing / risk ---
 CAPITAL_INR = 10_000                  # fixed margin per trade, in INR (converted to USDT at runtime)
 DESIRED_LEVERAGE = 5                  # target leverage; if a symbol's max_leverage is lower,
@@ -873,6 +920,25 @@ def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
     return candidates
 
 
+def screen_candidates_v2(tickers, top_cap_symbols):
+    """Strategy 2's screener. Per instruction: ONLY the top-100-market-cap
+    exclusion applies — no 24h-drop-% requirement and deliberately NO
+    24h-volume check. Every remaining CoinSwitch futures symbol with a
+    readable last_price is a candidate; the actual entry decision is made
+    purely off 5m RSI in enter_trades_strategy2()."""
+    candidates = []
+    for symbol, t in tickers.items():
+        base_symbol = symbol.replace("USDT", "").upper()
+        if base_symbol in top_cap_symbols:
+            continue
+        try:
+            last_price = float(t["last_price"])
+        except (KeyError, ValueError):
+            continue
+        candidates.append({"symbol": symbol, "last_price": last_price})
+    return candidates
+
+
 # ------------------------------ Resistance detection ---------------------------
 
 def find_resistance_levels(candles, pivot_wing=PIVOT_WING, tolerance_pct=RESISTANCE_TOLERANCE_PCT):
@@ -1164,6 +1230,7 @@ def save_state(open_shorts, daily_trade_tracker):
         payload = {
             "open_shorts": open_shorts,
             "daily_trade_tracker": daily_trade_tracker,
+            "active_strategy": strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT),
             "saved_at_ms": int(time.time() * 1000),
         }
         tmp_path = STATE_FILE_PATH + ".tmp"
@@ -1184,6 +1251,10 @@ def load_state():
     try:
         with open(STATE_FILE_PATH, "r") as f:
             payload = json.load(f)
+        saved_strategy = payload.get("active_strategy")
+        if saved_strategy in ("1", "2"):
+            strategy_state["active"] = saved_strategy
+            print(f"  [state] restored active strategy from saved state: strategy {saved_strategy}")
         return payload.get("open_shorts") or {}, payload.get("daily_trade_tracker")
     except FileNotFoundError:
         return None, None
@@ -1247,6 +1318,11 @@ def recover_open_positions(instruments, daily_trade_tracker):
         # doesn't crash check_liquidation_warnings()/send_position_status_update().
         pos.setdefault("leverage", DESIRED_LEVERAGE)
         pos.setdefault("liquidation_warning_sent", False)
+        # Backfill for state saved before strategy 2 (long support) existed —
+        # every position tracked back then was strategy 1's SHORT-only, so
+        # that's the correct default, not a guess.
+        pos.setdefault("side", "SHORT")
+        pos.setdefault("strategy", "1")
     if recovered:
         print(f"  [state] restored {len(recovered)} simulated (DRY RUN) open short(s) "
               f"from saved state: {', '.join(recovered.keys())}")
@@ -1278,15 +1354,17 @@ def recover_open_positions(instruments, daily_trade_tracker):
             # entry price -> "avg_entry_price", size -> "position_size",
             # direction -> "position_side" ("LONG"/"SHORT"). The old field-name
             # guessing here never matched those, so entry_price/qty were always
-            # None. Also skip anything that isn't actually a SHORT — this bot
-            # never opens longs, so a LONG on a symbol is either a manual
-            # position or leftover from something else, and treating it as one
-            # of ours would permanently block shorting that symbol and corrupt
-            # P&L math whenever it's "closed".
+            # None. Strategy 2 can open LONGs as well as SHORTs, so both
+            # directions are now tracked (side is recorded below and every
+            # downstream P&L/liquidation/close calculation branches on it) —
+            # previously anything not SHORT was assumed to be a stray manual
+            # position and ignored; that's no longer a safe assumption now
+            # that this bot itself opens longs too.
             p = positions[0]
-            if p.get("position_side") not in (None, "SHORT"):
-                print(f"  [recover] {symbol}: open position is {p.get('position_side')}, "
-                      f"not SHORT — not tracking it as one of this bot's trades. Raw: {p}")
+            live_side = p.get("position_side") or "SHORT"
+            if live_side not in ("SHORT", "LONG"):
+                print(f"  [recover] {symbol}: open position has an unrecognized position_side "
+                      f"({live_side!r}) — not tracking it as one of this bot's trades. Raw: {p}")
                 time.sleep(3.1)
                 continue
 
@@ -1315,10 +1393,18 @@ def recover_open_positions(instruments, daily_trade_tracker):
                 tp_price = saved.get("tp_price")
                 opened_at_ms = saved.get("opened_at_ms", int(time.time() * 1000))
                 liquidation_warning_sent = saved.get("liquidation_warning_sent", False)
+                # Saved state (if any) knows which strategy actually opened
+                # this position; trust that over guessing. If there's no
+                # matching saved entry (e.g. state file lost), fall back to
+                # inferring from direction — strategy 1 has only ever opened
+                # SHORTs, so a recovered LONG with no saved match must be
+                # strategy 2's.
+                strategy = saved.get("strategy") or ("2" if live_side == "LONG" else "1")
             else:
                 tp_price = None
                 opened_at_ms = int(time.time() * 1000)  # true entry time unknown otherwise
                 liquidation_warning_sent = False
+                strategy = "2" if live_side == "LONG" else "1"
 
             # Leverage actually set on the exchange for a position opened
             # before this restart isn't returned consistently by every
@@ -1349,6 +1435,8 @@ def recover_open_positions(instruments, daily_trade_tracker):
                 "simulated": False,           # always a real exchange position, regardless of today's DRY_RUN setting
                 "leverage": leverage,
                 "liquidation_warning_sent": liquidation_warning_sent,
+                "side": live_side,
+                "strategy": strategy,
             }
             print(f"  [recover] {symbol}: found an existing open position — now tracked. Raw: {p}")
 
@@ -1440,9 +1528,18 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
                 last_price = float(t["last_price"])
             except (KeyError, ValueError):
                 continue
-            if pos["tp_price"] is not None and last_price <= pos["tp_price"]:
-                pnl = (pos["entry_price"] - pos["tp_price"]) * pos["qty"]
-                closed.append((symbol, pnl, pos, "take_profit"))
+            side = pos.get("side", "SHORT")
+            if pos["tp_price"] is not None:
+                tp_hit = (
+                    last_price <= pos["tp_price"] if side == "SHORT"
+                    else last_price >= pos["tp_price"]
+                )
+                if tp_hit:
+                    pnl = (
+                        (pos["entry_price"] - pos["tp_price"]) * pos["qty"] if side == "SHORT"
+                        else (pos["tp_price"] - pos["entry_price"]) * pos["qty"]
+                    )
+                    closed.append((symbol, pnl, pos, "take_profit"))
         else:
             try:
                 live_positions = get_positions(symbol)
@@ -1502,22 +1599,25 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
 
 # ------------------------------ Position monitoring ------------------------------
 
-def estimate_liquidation_price(entry_price, leverage):
-    """Rough isolated-margin liquidation price estimate for a SHORT position,
-    ignoring maintenance margin rate, funding, and fees — none of which this
-    script fetches from CoinSwitch. A short's margin (entry_price*qty/leverage)
-    is fully wiped once price has risen by entry_price/leverage, so:
+def estimate_liquidation_price(entry_price, leverage, side="SHORT"):
+    """Rough isolated-margin liquidation price estimate, ignoring maintenance
+    margin rate, funding, and fees — none of which this script fetches from
+    CoinSwitch. A position's margin (entry_price*qty/leverage) is fully
+    wiped once price has moved against it by entry_price/leverage, so:
 
-        liq_price ~= entry_price * (1 + 1/leverage)
+        SHORT: liq_price ~= entry_price * (1 + 1/leverage)   (price UP wipes it)
+        LONG:  liq_price ~= entry_price * (1 - 1/leverage)   (price DOWN wipes it)
 
     In reality the exchange liquidates earlier than this once losses eat into
     the maintenance margin buffer, so treat this as an optimistic upper bound
     on how much room the position actually has — the real liquidation price
-    is always somewhat below (i.e. closer, in adverse-move terms) this
-    estimate. Good enough for an early-warning Telegram alert; not something
-    to rely on for precise risk sizing."""
+    is always somewhat closer (in adverse-move terms) than this estimate.
+    Good enough for an early-warning Telegram alert; not something to rely on
+    for precise risk sizing."""
     if not leverage or leverage <= 0:
         return None
+    if side == "LONG":
+        return entry_price * (1 - 1.0 / leverage)
     return entry_price * (1 + 1.0 / leverage)
 
 
@@ -1544,10 +1644,18 @@ def check_liquidation_warnings(open_shorts, tickers):
         except (KeyError, ValueError):
             continue
 
-        liq_price = estimate_liquidation_price(entry_price, leverage)
-        if liq_price is None or liq_price <= entry_price:
+        liq_price = estimate_liquidation_price(entry_price, leverage, pos.get("side", "SHORT"))
+        if liq_price is None:
             continue
-        distance_covered_pct = (current_price - entry_price) / (liq_price - entry_price) * 100
+        side = pos.get("side", "SHORT")
+        if side == "SHORT":
+            if liq_price <= entry_price:
+                continue
+            distance_covered_pct = (current_price - entry_price) / (liq_price - entry_price) * 100
+        else:
+            if liq_price >= entry_price:
+                continue
+            distance_covered_pct = (entry_price - current_price) / (entry_price - liq_price) * 100
 
         already_sent = pos.get("liquidation_warning_sent", False)
         if distance_covered_pct >= LIQUIDATION_WARNING_PCT:
@@ -1555,7 +1663,7 @@ def check_liquidation_warnings(open_shorts, tickers):
                 print(f"  [liquidation] {symbol}: {distance_covered_pct:.0f}% of the way to "
                       f"estimated liquidation ({liq_price:.6g}) — sending warning.")
                 send_telegram_message(
-                    f"⚠️ {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} short is "
+                    f"⚠️ {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} {side} is "
                     f"~{distance_covered_pct:.0f}% of the way to its estimated liquidation price.\n"
                     f"Entry: {entry_price}  |  Current: {current_price}  |  Leverage: {leverage}x\n"
                     f"Est. liquidation: ~{liq_price:.6g} (rough estimate — ignores maintenance "
@@ -1596,8 +1704,13 @@ def check_loss_warnings(open_shorts, tickers):
         except (KeyError, ValueError):
             continue
 
+        side = pos.get("side", "SHORT")
         # SHORT: profit when price falls, loss when price rises above entry.
-        unrealized = (entry_price - current_price) * qty
+        # LONG: profit when price rises, loss when price falls below entry.
+        unrealized = (
+            (entry_price - current_price) * qty if side == "SHORT"
+            else (current_price - entry_price) * qty
+        )
         if unrealized >= 0:
             # In profit (or flat) — make sure the flag is re-armed and move on.
             if pos.get("loss_warning_sent", False):
@@ -1616,7 +1729,7 @@ def check_loss_warnings(open_shorts, tickers):
                 print(f"  [loss alert] {symbol}: unrealized loss is {loss_pct:.1f}% of margin "
                       f"({unrealized:+.2f} USDT) — sending warning.")
                 send_telegram_message(
-                    f"🔻 {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} short is down "
+                    f"🔻 {'[DRY RUN] ' if pos.get('simulated') else ''}{symbol} {side} is down "
                     f"{loss_pct:.1f}% of margin ({unrealized:+.2f} USDT).\n"
                     f"Entry: {entry_price}  |  Current: {current_price}  |  Leverage: {leverage}x"
                 )
@@ -1660,14 +1773,21 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
             if current_price is None:
                 lines.append(f"{symbol}: current price unavailable this cycle")
             else:
+                side = pos.get("side", "SHORT")
+                strategy = pos.get("strategy", "1")
                 # SHORT: profit when price has fallen below entry.
-                unrealized = (entry_price - current_price) * qty
-                pct_move = (entry_price - current_price) / entry_price * 100
+                # LONG: profit when price has risen above entry.
+                if side == "SHORT":
+                    unrealized = (entry_price - current_price) * qty
+                    pct_move = (entry_price - current_price) / entry_price * 100
+                else:
+                    unrealized = (current_price - entry_price) * qty
+                    pct_move = (current_price - entry_price) / entry_price * 100
                 emoji = "🟢" if unrealized > 0 else ("🔴" if unrealized < 0 else "⚪")
                 total_unrealized += unrealized
                 priced_count += 1
                 lines.append(
-                    f"{emoji} {symbol}{' [DRY RUN]' if pos.get('simulated') else ''}: "
+                    f"{emoji} {symbol} [{side}/S{strategy}]{' [DRY RUN]' if pos.get('simulated') else ''}: "
                     f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
                     f"entry {entry_price} -> now {current_price}"
                 )
@@ -1767,6 +1887,8 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
     is_simulated = pos.get("simulated", DRY_RUN)
     qty = pos.get("qty")
     entry_price = pos.get("entry_price")
+    side = pos.get("side", "SHORT")
+    close_side = "BUY" if side == "SHORT" else "SELL"  # closing a SHORT buys it back, closing a LONG sells it
 
     if is_simulated:
         # Nothing real was ever placed on the exchange, so there's nothing to
@@ -1781,13 +1903,16 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
         except Exception as e:
             print(f"  [manual close] {symbol}: couldn't fetch price for P&L estimate ({e}).")
         if entry_price is not None and last_price is not None and qty is not None:
-            pnl = (entry_price - last_price) * qty
+            pnl = (
+                (entry_price - last_price) * qty if side == "SHORT"
+                else (last_price - entry_price) * qty
+            )
         else:
             pnl = 0.0
-        print(f"  [manual close] {symbol}: [DRY RUN] closing simulated position, est P&L {pnl:+.2f} USDT.")
+        print(f"  [manual close] {symbol}: [DRY RUN] closing simulated {side} position, est P&L {pnl:+.2f} USDT.")
     else:
         try:
-            resp = place_order(symbol, side="BUY", order_type="MARKET", quantity=qty, reduce_only=True)
+            resp = place_order(symbol, side=close_side, order_type="MARKET", quantity=qty, reduce_only=True)
             print(f"  [manual close] {symbol}: close order placed -> {resp['data']}")
         except Exception as e:
             print(f"  [manual close] {symbol}: failed to place close order ({e}).")
@@ -1834,6 +1959,9 @@ def send_help_message():
         "/fees — brokerage (commission), funding fees, and net P&L after fees (today + all-time)",
         f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
+        "/strategy — show which strategy is currently active for new trades",
+        "/strategy1 — switch to Strategy 1 (resistance/RSI(77) SHORT-only)",
+        "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 SHORT+LONG)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
@@ -2068,7 +2196,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         return
 
     print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, /fees, "
-          "/cooldowns, /debugvolume, /pause, /resume, /help commands...")
+          "/cooldowns, /debugvolume, /strategy, /strategy1, /strategy2, /pause, /resume, /help commands...")
     offset = None
     while True:
         try:
@@ -2155,6 +2283,33 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         bot_paused.clear()
                         print("  [telegram] /resume — new entries re-enabled")
                         send_telegram_message("▶️ Resumed. Scanning for new entries again.")
+                elif text in ("/strategy1", "/strategy2"):
+                    requested = text[-1]  # "1" or "2"
+                    with state_lock:
+                        current = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+                        if current == requested:
+                            send_telegram_message(f"Already on Strategy {requested} — no change.")
+                        else:
+                            strategy_state["active"] = requested
+                            save_state(open_shorts, daily_trade_tracker)
+                            print(f"  [telegram] switched active strategy: {current} -> {requested}")
+                            name = ("resistance/RSI(77) SHORT-only" if requested == "1"
+                                    else "RSI(14) 80/20 SHORT+LONG")
+                            send_telegram_message(
+                                f"🔀 Switched to Strategy {requested} ({name}) for NEW trades.\n"
+                                f"Any positions already open (from either strategy) keep being "
+                                f"monitored and closed normally — this only changes what gets "
+                                f"entered going forward."
+                            )
+                elif text == "/strategy":
+                    with state_lock:
+                        current = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+                    send_telegram_message(
+                        f"Active strategy: {current}\n"
+                        f"1 = resistance/RSI(77) SHORT-only\n"
+                        f"2 = RSI(14) 80/20 SHORT+LONG\n"
+                        f"Switch with /strategy1 or /strategy2."
+                    )
                 elif text in ("/help", "/commands"):
                     print("  [telegram] /help requested")
                     try:
@@ -2285,130 +2440,14 @@ def heartbeat_loop(open_shorts):
 
 # ------------------------------ Main loop ---------------------------------------
 
-def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
-             last_market_refresh_date, last_status_update_ms):
-    try:
-        tickers = get_all_tickers()
-    except Exception as e:
-        record_fetch_failure("scan cycle", e)
-        raise
-    record_fetch_success()
-    # Everything in this block reads and/or mutates open_shorts /
-    # daily_trade_tracker, the same state telegram_polling_loop() touches the
-    # instant a "Close" button is tapped — held under state_lock so a manual
-    # close can't interleave mid-reconcile and corrupt the shared dicts.
-    with state_lock:
-        reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
-
-        # Liquidation-distance check runs every cycle (not on the 15-minute
-        # status timer) since an adverse move can cross the warning threshold
-        # well before the next scheduled status update.
-        if check_liquidation_warnings(open_shorts, tickers):
-            save_state(open_shorts, daily_trade_tracker)
-
-        # Same reasoning as the liquidation check above — a position can
-        # cross the loss threshold well before the next scheduled status
-        # update, so this also runs every cycle rather than on the 15-minute
-        # timer.
-        if check_loss_warnings(open_shorts, tickers):
-            save_state(open_shorts, daily_trade_tracker)
-
-        now_ms = int(time.time() * 1000)
-        if now_ms - last_status_update_ms >= STATUS_UPDATE_INTERVAL_SECONDS * 1000:
-            send_position_status_update(open_shorts, tickers)
-            last_status_update_ms = now_ms
-
-    today = today_ist()
-
-    # Refresh the top-100 market-cap exclusion list and the USDT/INR
-    # conversion rate once per IST calendar day. These were previously only
-    # ever fetched once at process startup and then reused for the entire
-    # lifetime of the container — on Railway that can mean running for days
-    # against a market-cap ranking and FX rate that are stale by then. A coin
-    # that's fallen out of (or risen into) the top 100 since startup would be
-    # screened against the wrong exclusion list, and the margin-per-trade
-    # sizing (CAPITAL_INR / usdt_inr_rate) would silently drift from its
-    # intended INR value as the real USDT/INR rate moves.
-    if last_market_refresh_date != today:
-        try:
-            top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
-            usdt_inr_rate = get_usdt_inr_rate()
-            last_market_refresh_date = today
-            print(f"  [refresh] top-100 market cap list and USDT/INR rate refreshed for {today} "
-                  f"(USDT/INR ~= {usdt_inr_rate}).")
-        except requests.HTTPError as e:
-            # Don't let a transient CoinGecko blip abort this cycle's scan —
-            # keep using the previous values and try the refresh again next
-            # cycle (last_market_refresh_date is only advanced on success).
-            print(f"  [refresh] failed to refresh market cap list / USDT-INR rate ({e}), "
-                  f"keeping previous values for this cycle.")
-
-    # Fixed CAPITAL_INR margin per trade, converted to USDT at the live rate.
-    order_margin_usdt = CAPITAL_INR / usdt_inr_rate
-
-    # Check available balance (USDT + INR, combined at the live rate) BEFORE
-    # doing any real work this cycle — including screening candidates. If
-    # there isn't enough free margin for even one trade, there's no point
-    # scanning the market at all this cycle: just wait for the wallet to be
-    # topped up (or for a position to close and free margin) and try again
-    # next cycle. This gate is skipped entirely when DRY_RUN is on, so
-    # paper-trading can keep scanning/simulating regardless of the real
-    # account balance — it's still enforced for live trading, where it now
-    # blocks both the search AND the trade, not just the trade.
-    try:
-        available_balance_usdt = get_wallet_balance(usdt_inr_rate)["total_usdt"]
-    except requests.HTTPError as e:
-        print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
-        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
-
-    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
-        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
-              f"not scanning for new trades this cycle. Existing open positions are unaffected.")
-        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
-    elif DRY_RUN and available_balance_usdt < order_margin_usdt:
-        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
-              f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
-
-    candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
-
-    # Reset the daily counters if the calendar day has rolled over (IST).
-    # Send yesterday's P&L summary to Telegram before wiping the numbers.
-    if daily_trade_tracker["date"] != today:
-        with state_lock:
-            send_daily_summary(daily_trade_tracker, open_shorts)
-            backup_trade_history()
-            daily_trade_tracker["date"] = today
-            daily_trade_tracker["count"] = 0
-            daily_trade_tracker["realized_pnl_usdt"] = 0.0
-            daily_trade_tracker["trades_closed"] = 0
-            daily_trade_tracker["wins"] = 0
-            daily_trade_tracker["losses"] = 0
-            save_state(open_shorts, daily_trade_tracker)
-
-    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-          f"{len(candidates)} symbol(s) pass the market-cap/drop/volume filter. "
-          f"Trades today: {daily_trade_tracker['count']}/{MAX_TRADES_PER_DAY}")
-
-    if bot_paused.is_set():
-        # Paused via /pause — skip opening new trades entirely this cycle,
-        # but everything above (reconcile, liquidation checks, status
-        # updates, daily rollover) still ran normally, and manual closes via
-        # Telegram still work independently on their own thread.
-        if candidates:
-            print(f"  [paused] {len(candidates)} candidate(s) passed screening but the bot is "
-                  f"paused (/resume to re-enable) — skipping new entries.")
-        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
-
-    # Drop cooldown entries older than the window so this dict doesn't grow
-    # forever across a long-running process — done once per cycle rather than
-    # per-candidate since it's the same cutoff for every symbol.
-    cooldown_cutoff_ms = now_ms - ENTRY_COOLDOWN_MS
-    daily_trade_tracker["recent_entries"] = {
-        s: t for s, t in daily_trade_tracker["recent_entries"].items() if t >= cooldown_cutoff_ms
-    }
-
+def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available_balance_usdt,
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+    """Strategy 1's entry loop — resistance/RSI(77) SHORT-only signal, byte-for-byte
+    the same decision logic run_once() used to run inline before strategy 2
+    existed. Only called when strategy 1 is the active strategy (see
+    run_once()). Returns the (possibly decremented) available_balance_usdt so
+    the caller's own wallet bookkeeping stays in sync across calls within the
+    same cycle."""
     for cand in candidates:
         symbol = cand["symbol"]
         if symbol in open_shorts:
@@ -2534,7 +2573,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         qty = filled_qty
 
         entry_msg = (
-            f"{'[DRY RUN] ' if DRY_RUN else ''}SHORT {symbol}\n"
+            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 1] SHORT {symbol}\n"
             f"Entry: {cand['last_price']} (market)\n"
             f"Qty: {qty}  |  Leverage: {leverage}x"
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
@@ -2572,6 +2611,8 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
                                                          # alert has already fired for this position, so we
                                                          # don't re-send it every single cycle it stays past
                                                          # threshold — see check_liquidation_warnings().
+                "side": "SHORT",
+                "strategy": "1",
             }
             # Recorded for both real and DRY_RUN entries — the no-re-entry
             # rule (ENTRY_COOLDOWN_HOURS) is a screening/behavior decision,
@@ -2580,6 +2621,301 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
             save_state(open_shorts, daily_trade_tracker)
 
+    return available_balance_usdt
+
+
+def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available_balance_usdt,
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+    """Strategy 2's entry loop. `candidates` is already narrowed to non-top-100
+    symbols only (see screen_candidates_v2()) — deliberately no 24h-drop-% or
+    volume filter for this strategy. Signal is pure 5m-candle RSI, checked in
+    both directions:
+        RSI > STRATEGY2_RSI_OVERBOUGHT (80) -> SHORT
+        RSI < STRATEGY2_RSI_OVERSOLD   (20) -> LONG
+    Anything in between is not a signal. Leverage resolution, the daily trade
+    cap, the re-entry cooldown, and wallet-balance gating all reuse the exact
+    same mechanisms strategy 1 uses (resolve_leverage(), MAX_TRADES_PER_DAY,
+    ENTRY_COOLDOWN_MS, available_balance_usdt) so the two strategies behave
+    consistently around risk/pacing even though their signals differ."""
+    for cand in candidates:
+        symbol = cand["symbol"]
+        if symbol in open_shorts:
+            continue
+        last_entry_ms = daily_trade_tracker["recent_entries"].get(symbol)
+        if last_entry_ms is not None and last_entry_ms >= cooldown_cutoff_ms:
+            hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but was entered within the last "
+                  f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
+            continue
+        if daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
+            print("  Daily trade limit reached, no further entries until tomorrow.")
+            break
+        if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+            print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is now below "
+                  f"the {order_margin_usdt:.2f} USDT needed for another trade — stopping new "
+                  f"entries for this cycle.")
+            break
+
+        time.sleep(2.1)  # same KLines rate-limit pacing as strategy 1's loop
+
+        try:
+            candles = get_klines(symbol)
+        except requests.HTTPError as e:
+            print(f"  {symbol}: klines fetch failed ({e}), skipping.")
+            continue
+
+        rsi_value = compute_rsi(candles)
+        if rsi_value is None:
+            continue  # not enough closed 5m candles yet for this symbol
+
+        if rsi_value > STRATEGY2_RSI_OVERBOUGHT:
+            side = "SHORT"
+        elif rsi_value < STRATEGY2_RSI_OVERSOLD:
+            side = "LONG"
+        else:
+            continue  # RSI is in the neutral zone — no signal
+
+        threshold = STRATEGY2_RSI_OVERBOUGHT if side == "SHORT" else STRATEGY2_RSI_OVERSOLD
+        print(f"  >>> {symbol}: price {cand['last_price']}, RSI {rsi_value:.1f} "
+              f"({'>' if side == 'SHORT' else '<'} {threshold:g}) — [Strategy 2] {side} signal")
+
+        instrument = instruments.get(symbol)
+        if instrument is None:
+            print(f"      no instrument info for {symbol}, skipping order.")
+            continue
+
+        leverage = resolve_leverage(instrument)
+        if leverage < DESIRED_LEVERAGE:
+            print(f"      {symbol}: {DESIRED_LEVERAGE}x not available, using max {leverage}x instead.")
+        elif leverage > DESIRED_LEVERAGE:
+            print(f"      {symbol}: this symbol's own minimum leverage ({leverage}x) is above "
+                  f"{DESIRED_LEVERAGE}x — trading at {leverage}x instead, which is MORE leverage "
+                  f"than desired. Consider skipping this symbol if that's not acceptable.")
+        set_leverage(symbol, leverage)
+
+        qty = compute_quantity(cand["last_price"], order_margin_usdt, leverage, instrument)
+        price_precision = int(instrument.get("price_precision", 4))
+
+        entry_side = "SELL" if side == "SHORT" else "BUY"
+        resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
+        opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP order below
+        print(f"      order response: {resp['data']}")
+        daily_trade_tracker["count"] += 1
+
+        # Same partial-fill handling as strategy 1 — size everything
+        # downstream off what actually filled, not what was requested.
+        try:
+            filled_qty = float(resp["data"].get("exec_quantity", qty))
+        except (TypeError, ValueError):
+            filled_qty = qty
+        if filled_qty <= 0:
+            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
+                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            continue
+        if filled_qty != qty:
+            print(f"      {symbol}: requested {qty}, filled {filled_qty} "
+                  f"(partial fill) — sizing take-profit off the filled amount.")
+        available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
+        qty = filled_qty
+
+        entry_msg = (
+            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 2] {side} {symbol}\n"
+            f"Entry: {cand['last_price']} (market)\n"
+            f"Qty: {qty}  |  Leverage: {leverage}x"
+            f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
+            f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
+            f"Signal: RSI {rsi_value:.1f} on 5m chart\n"
+            f"No stop-loss set on this position."
+        )
+        send_telegram_message(entry_msg)
+
+        # Take-profit: STRATEGY2_TP_CAPITAL_PCT% return on CAPITAL EMPLOYED
+        # (i.e. on the margin, NOT on the leveraged notional), converted to a
+        # price move using this trade's actual leverage (which may be below
+        # DESIRED_LEVERAGE) — same "% on capital -> % price move" conversion
+        # strategy 1 uses, just direction-aware (short exits below entry,
+        # long exits above entry).
+        tp_price_pct = STRATEGY2_TP_CAPITAL_PCT / leverage
+        tp_price = cand["last_price"]
+        if STRATEGY2_TP_CAPITAL_PCT > 0:
+            if side == "SHORT":
+                tp_price = round(cand["last_price"] * (1 - tp_price_pct / 100), price_precision)
+                tp_close_side = "BUY"
+            else:
+                tp_price = round(cand["last_price"] * (1 + tp_price_pct / 100), price_precision)
+                tp_close_side = "SELL"
+            tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
+                                   quantity=qty, price=tp_price, reduce_only=True)
+            print(f"      take-profit @ {tp_price} "
+                  f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
+            send_telegram_message(
+                f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
+                f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital)"
+            )
+
+        with state_lock:
+            open_shorts[symbol] = {
+                "entry_price": cand["last_price"],
+                "qty": qty,
+                "tp_price": tp_price,
+                "opened_at_ms": opened_at_ms,
+                "simulated": DRY_RUN,
+                "leverage": leverage,
+                "liquidation_warning_sent": False,
+                "side": side,
+                "strategy": "2",
+            }
+            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
+            save_state(open_shorts, daily_trade_tracker)
+
+    return available_balance_usdt
+
+
+def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
+             last_market_refresh_date, last_status_update_ms):
+    try:
+        tickers = get_all_tickers()
+    except Exception as e:
+        record_fetch_failure("scan cycle", e)
+        raise
+    record_fetch_success()
+    # Everything in this block reads and/or mutates open_shorts /
+    # daily_trade_tracker, the same state telegram_polling_loop() touches the
+    # instant a "Close" button is tapped — held under state_lock so a manual
+    # close can't interleave mid-reconcile and corrupt the shared dicts.
+    with state_lock:
+        reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
+
+        # Liquidation-distance check runs every cycle (not on the 15-minute
+        # status timer) since an adverse move can cross the warning threshold
+        # well before the next scheduled status update.
+        if check_liquidation_warnings(open_shorts, tickers):
+            save_state(open_shorts, daily_trade_tracker)
+
+        # Same reasoning as the liquidation check above — a position can
+        # cross the loss threshold well before the next scheduled status
+        # update, so this also runs every cycle rather than on the 15-minute
+        # timer.
+        if check_loss_warnings(open_shorts, tickers):
+            save_state(open_shorts, daily_trade_tracker)
+
+        now_ms = int(time.time() * 1000)
+        if now_ms - last_status_update_ms >= STATUS_UPDATE_INTERVAL_SECONDS * 1000:
+            send_position_status_update(open_shorts, tickers)
+            last_status_update_ms = now_ms
+
+    today = today_ist()
+
+    # Refresh the top-100 market-cap exclusion list and the USDT/INR
+    # conversion rate once per IST calendar day. These were previously only
+    # ever fetched once at process startup and then reused for the entire
+    # lifetime of the container — on Railway that can mean running for days
+    # against a market-cap ranking and FX rate that are stale by then. A coin
+    # that's fallen out of (or risen into) the top 100 since startup would be
+    # screened against the wrong exclusion list, and the margin-per-trade
+    # sizing (CAPITAL_INR / usdt_inr_rate) would silently drift from its
+    # intended INR value as the real USDT/INR rate moves.
+    if last_market_refresh_date != today:
+        try:
+            top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
+            usdt_inr_rate = get_usdt_inr_rate()
+            last_market_refresh_date = today
+            print(f"  [refresh] top-100 market cap list and USDT/INR rate refreshed for {today} "
+                  f"(USDT/INR ~= {usdt_inr_rate}).")
+        except requests.HTTPError as e:
+            # Don't let a transient CoinGecko blip abort this cycle's scan —
+            # keep using the previous values and try the refresh again next
+            # cycle (last_market_refresh_date is only advanced on success).
+            print(f"  [refresh] failed to refresh market cap list / USDT-INR rate ({e}), "
+                  f"keeping previous values for this cycle.")
+
+    # Fixed CAPITAL_INR margin per trade, converted to USDT at the live rate.
+    order_margin_usdt = CAPITAL_INR / usdt_inr_rate
+
+    # Check available balance (USDT + INR, combined at the live rate) BEFORE
+    # doing any real work this cycle — including screening candidates. If
+    # there isn't enough free margin for even one trade, there's no point
+    # scanning the market at all this cycle: just wait for the wallet to be
+    # topped up (or for a position to close and free margin) and try again
+    # next cycle. This gate is skipped entirely when DRY_RUN is on, so
+    # paper-trading can keep scanning/simulating regardless of the real
+    # account balance — it's still enforced for live trading, where it now
+    # blocks both the search AND the trade, not just the trade.
+    try:
+        available_balance_usdt = get_wallet_balance(usdt_inr_rate)["total_usdt"]
+    except requests.HTTPError as e:
+        print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+
+    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
+              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"not scanning for new trades this cycle. Existing open positions are unaffected.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+    elif DRY_RUN and available_balance_usdt < order_margin_usdt:
+        print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
+              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
+
+    active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+    if active_strategy == "1":
+        candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
+        filter_desc = "market-cap/drop/volume"
+    else:
+        candidates = screen_candidates_v2(tickers, top_cap_symbols)
+        filter_desc = "market-cap-only (strategy 2)"
+
+    # Reset the daily counters if the calendar day has rolled over (IST).
+    # Send yesterday's P&L summary to Telegram before wiping the numbers.
+    if daily_trade_tracker["date"] != today:
+        with state_lock:
+            send_daily_summary(daily_trade_tracker, open_shorts)
+            backup_trade_history()
+            daily_trade_tracker["date"] = today
+            daily_trade_tracker["count"] = 0
+            daily_trade_tracker["realized_pnl_usdt"] = 0.0
+            daily_trade_tracker["trades_closed"] = 0
+            daily_trade_tracker["wins"] = 0
+            daily_trade_tracker["losses"] = 0
+            save_state(open_shorts, daily_trade_tracker)
+
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [Strategy {active_strategy} active] "
+          f"{len(candidates)} symbol(s) pass the {filter_desc} filter. "
+          f"Trades today: {daily_trade_tracker['count']}/{MAX_TRADES_PER_DAY}")
+
+    if bot_paused.is_set():
+        # Paused via /pause — skip opening new trades entirely this cycle,
+        # but everything above (reconcile, liquidation checks, status
+        # updates, daily rollover) still ran normally, and manual closes via
+        # Telegram still work independently on their own thread.
+        if candidates:
+            print(f"  [paused] {len(candidates)} candidate(s) passed screening but the bot is "
+                  f"paused (/resume to re-enable) — skipping new entries.")
+        return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
+
+    # Drop cooldown entries older than the window so this dict doesn't grow
+    # forever across a long-running process — done once per cycle rather than
+    # per-candidate since it's the same cutoff for every symbol.
+    cooldown_cutoff_ms = now_ms - ENTRY_COOLDOWN_MS
+    daily_trade_tracker["recent_entries"] = {
+        s: t for s, t in daily_trade_tracker["recent_entries"].items() if t >= cooldown_cutoff_ms
+    }
+
+    # Dispatch to whichever strategy is currently active. Positions already
+    # open from the OTHER strategy are unaffected either way — they keep
+    # being reconciled/monitored/closeable above and earlier in this
+    # function regardless of which strategy is opening new trades right now.
+    if active_strategy == "1":
+        available_balance_usdt = enter_trades_strategy1(
+            candidates, instruments, order_margin_usdt, available_balance_usdt,
+            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+        )
+    else:
+        available_balance_usdt = enter_trades_strategy2(
+            candidates, instruments, order_margin_usdt, available_balance_usdt,
+            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+        )
     # Returned so main()'s loop can carry the (possibly refreshed) market
     # data and refresh-date marker into the next cycle — run_once() itself
     # is stateless between calls otherwise.
@@ -2637,10 +2973,13 @@ def main():
     # full 15 minutes after every restart before the first snapshot.
     last_status_update_ms = 0
 
-    print(f"DRY_RUN = {DRY_RUN}. Max {MAX_TRADES_PER_DAY} trades/day. "
+    print(f"DRY_RUN = {DRY_RUN}. Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)}. "
+          f"Max {MAX_TRADES_PER_DAY} trades/day. "
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
+        f"Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)} "
+        f"({'resistance/RSI(77) SHORT-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 SHORT+LONG'}).\n"
         f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day. "
         f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s. "
         f"Heartbeat every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.\n"
@@ -2649,6 +2988,7 @@ def main():
         f"/analytics for win rate/profit factor/drawdown stats, "
         f"/cooldowns to see symbols on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown, "
         f"/debugvolume SYMBOL to inspect raw kline volume data, "
+        f"/strategy to check the active strategy, /strategy1 or /strategy2 to switch, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
 
