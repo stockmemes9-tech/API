@@ -1962,7 +1962,7 @@ def send_help_message():
         f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/strategy — show which strategy is currently active for new trades",
-        "/strategy1 — switch to Strategy 1 (resistance/RSI(77) SHORT-only)",
+        "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
@@ -2295,7 +2295,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                             strategy_state["active"] = requested
                             save_state(open_shorts, daily_trade_tracker)
                             print(f"  [telegram] switched active strategy: {current} -> {requested}")
-                            name = ("resistance/RSI(77) SHORT-only" if requested == "1"
+                            name = ("resistance/RSI(77) LONG-only" if requested == "1"
                                     else "RSI(14) 80/20 on 1h SHORT+LONG")
                             send_telegram_message(
                                 f"🔀 Switched to Strategy {requested} ({name}) for NEW trades.\n"
@@ -2308,7 +2308,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         current = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
                     send_telegram_message(
                         f"Active strategy: {current}\n"
-                        f"1 = resistance/RSI(77) SHORT-only\n"
+                        f"1 = resistance/RSI(77) LONG-only\n"
                         f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
                         f"Switch with /strategy1 or /strategy2."
                     )
@@ -2444,12 +2444,12 @@ def heartbeat_loop(open_shorts):
 
 def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available_balance_usdt,
                             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
-    """Strategy 1's entry loop — resistance/RSI(77) SHORT-only signal, byte-for-byte
-    the same decision logic run_once() used to run inline before strategy 2
-    existed. Only called when strategy 1 is the active strategy (see
-    run_once()). Returns the (possibly decremented) available_balance_usdt so
-    the caller's own wallet bookkeeping stays in sync across calls within the
-    same cycle."""
+    """Strategy 1's entry loop — resistance/RSI(77) LONG-only signal (same
+    resistance/RSI trigger logic run_once() used to run inline before strategy 2
+    existed, but now opens a LONG on trigger instead of a SHORT). Only called
+    when strategy 1 is the active strategy (see run_once()). Returns the
+    (possibly decremented) available_balance_usdt so the caller's own wallet
+    bookkeeping stays in sync across calls within the same cycle."""
     for cand in candidates:
         symbol = cand["symbol"]
         if symbol in open_shorts:
@@ -2526,7 +2526,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
               f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
               f"price {cand['last_price']}, {signal_reason} "
-              f"({' + '.join(confirmations) if confirmations else 'no extra confirmations'}) — SHORT signal")
+              f"({' + '.join(confirmations) if confirmations else 'no extra confirmations'}) — LONG signal")
 
         instrument = instruments.get(symbol)
         if instrument is None:
@@ -2545,7 +2545,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         qty = compute_quantity(cand["last_price"], order_margin_usdt, leverage, instrument)
         price_precision = int(instrument.get("price_precision", 4))
 
-        resp = place_order(symbol, side="SELL", order_type="MARKET", quantity=qty)
+        resp = place_order(symbol, side="BUY", order_type="MARKET", quantity=qty)
         opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP order below
         print(f"      order response: {resp['data']}")
         daily_trade_tracker["count"] += 1
@@ -2575,7 +2575,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         qty = filled_qty
 
         entry_msg = (
-            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 1] SHORT {symbol}\n"
+            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 1] LONG {symbol}\n"
             f"Entry: {cand['last_price']} (market)\n"
             f"Qty: {qty}  |  Leverage: {leverage}x"
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
@@ -2591,8 +2591,8 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         tp_price_pct = TP_CAPITAL_PCT / leverage
         tp_price = cand["last_price"]
         if TP_CAPITAL_PCT > 0:
-            tp_price = round(cand["last_price"] * (1 - tp_price_pct / 100), price_precision)
-            tp_resp = place_order(symbol, side="BUY", order_type="LIMIT",
+            tp_price = round(cand["last_price"] * (1 + tp_price_pct / 100), price_precision)
+            tp_resp = place_order(symbol, side="SELL", order_type="LIMIT",
                                    quantity=qty, price=tp_price, reduce_only=True)
             print(f"      take-profit @ {tp_price} "
                   f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
@@ -2613,7 +2613,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
                                                          # alert has already fired for this position, so we
                                                          # don't re-send it every single cycle it stays past
                                                          # threshold — see check_liquidation_warnings().
-                "side": "SHORT",
+                "side": "LONG",
                 "strategy": "1",
             }
             # Recorded for both real and DRY_RUN entries — the no-re-entry
@@ -2983,7 +2983,7 @@ def main():
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
         f"Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)} "
-        f"({'resistance/RSI(77) SHORT-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 on 1h SHORT+LONG'}).\n"
+        f"({'resistance/RSI(77) LONG-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 on 1h SHORT+LONG'}).\n"
         f"Scanning every {POLL_INTERVAL_SECONDS}s, {trade_cap_desc}. "
         f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s. "
         f"Heartbeat every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.\n"
