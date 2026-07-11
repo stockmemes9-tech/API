@@ -272,7 +272,7 @@ RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest cl
 #     strategy 1 uses). No 24h-drop-%, and deliberately NO 24h-volume check
 #     (per instruction) — every non-top-100 CoinSwitch futures symbol is a
 #     candidate.
-#   - Entry, on the 5-minute chart:
+#   - Entry, on the 1-hour chart:
 #       RSI(14) above STRATEGY2_RSI_OVERBOUGHT (80) -> SHORT
 #       RSI(14) below STRATEGY2_RSI_OVERSOLD (20)    -> LONG
 #   - Leverage: same DESIRED_LEVERAGE (5x) target as strategy 1, falling
@@ -284,9 +284,11 @@ RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest cl
 #     conversion as strategy 1's TP_CAPITAL_PCT, just a different number and
 #     usable in either direction (short: price down; long: price up).
 STRATEGY2_ENABLED = True
-STRATEGY2_RSI_OVERBOUGHT = 80.0       # RSI strictly above this on the 5m chart -> SHORT
-STRATEGY2_RSI_OVERSOLD = 20.0         # RSI strictly below this on the 5m chart -> LONG
+STRATEGY2_RSI_OVERBOUGHT = 80.0       # RSI strictly above this on the 1h chart -> SHORT
+STRATEGY2_RSI_OVERSOLD = 20.0         # RSI strictly below this on the 1h chart -> LONG
 STRATEGY2_TP_CAPITAL_PCT = 1.0        # target: 1% profit on capital employed (not on leveraged notional)
+STRATEGY2_KLINE_INTERVAL = "60"       # minutes; "60" = 1h candles (strategy 1 stays on 5m, unchanged)
+STRATEGY2_LOOKBACK_CANDLES = 100      # ~4 days of 1h candles — plenty for a 14-period RSI
 
 # Which strategy is currently allowed to open NEW trades: "1" or "2". Read
 # from env as the default on a fresh deploy, then overridable live via
@@ -1961,7 +1963,7 @@ def send_help_message():
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/strategy — show which strategy is currently active for new trades",
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) SHORT-only)",
-        "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 SHORT+LONG)",
+        "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
@@ -2294,7 +2296,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                             save_state(open_shorts, daily_trade_tracker)
                             print(f"  [telegram] switched active strategy: {current} -> {requested}")
                             name = ("resistance/RSI(77) SHORT-only" if requested == "1"
-                                    else "RSI(14) 80/20 SHORT+LONG")
+                                    else "RSI(14) 80/20 on 1h SHORT+LONG")
                             send_telegram_message(
                                 f"🔀 Switched to Strategy {requested} ({name}) for NEW trades.\n"
                                 f"Any positions already open (from either strategy) keep being "
@@ -2307,7 +2309,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                     send_telegram_message(
                         f"Active strategy: {current}\n"
                         f"1 = resistance/RSI(77) SHORT-only\n"
-                        f"2 = RSI(14) 80/20 SHORT+LONG\n"
+                        f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
                         f"Switch with /strategy1 or /strategy2."
                     )
                 elif text in ("/help", "/commands"):
@@ -2459,7 +2461,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
                   f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
                   f"~{hours_left:.1f}h.")
             continue
-        if daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
+        if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
             print("  Daily trade limit reached, no further entries until tomorrow.")
             break
         # No cap on how many positions can be open at once — the only limits
@@ -2628,7 +2630,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
                             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
     """Strategy 2's entry loop. `candidates` is already narrowed to non-top-100
     symbols only (see screen_candidates_v2()) — deliberately no 24h-drop-% or
-    volume filter for this strategy. Signal is pure 5m-candle RSI, checked in
+    volume filter for this strategy. Signal is pure 1h-candle RSI, checked in
     both directions:
         RSI > STRATEGY2_RSI_OVERBOUGHT (80) -> SHORT
         RSI < STRATEGY2_RSI_OVERSOLD   (20) -> LONG
@@ -2648,7 +2650,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
                   f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
                   f"~{hours_left:.1f}h.")
             continue
-        if daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
+        if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
             print("  Daily trade limit reached, no further entries until tomorrow.")
             break
         if not DRY_RUN and available_balance_usdt < order_margin_usdt:
@@ -2660,14 +2662,14 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
         time.sleep(2.1)  # same KLines rate-limit pacing as strategy 1's loop
 
         try:
-            candles = get_klines(symbol)
+            candles = get_klines(symbol, interval=STRATEGY2_KLINE_INTERVAL, limit=STRATEGY2_LOOKBACK_CANDLES)
         except requests.HTTPError as e:
             print(f"  {symbol}: klines fetch failed ({e}), skipping.")
             continue
 
         rsi_value = compute_rsi(candles)
         if rsi_value is None:
-            continue  # not enough closed 5m candles yet for this symbol
+            continue  # not enough closed 1h candles yet for this symbol
 
         if rsi_value > STRATEGY2_RSI_OVERBOUGHT:
             side = "SHORT"
@@ -2725,7 +2727,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
             f"Qty: {qty}  |  Leverage: {leverage}x"
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
-            f"Signal: RSI {rsi_value:.1f} on 5m chart\n"
+            f"Signal: RSI {rsi_value:.1f} on 1h chart\n"
             f"No stop-loss set on this position."
         )
         send_telegram_message(entry_msg)
@@ -2882,7 +2884,8 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [Strategy {active_strategy} active] "
           f"{len(candidates)} symbol(s) pass the {filter_desc} filter. "
-          f"Trades today: {daily_trade_tracker['count']}/{MAX_TRADES_PER_DAY}")
+          f"Trades today: {daily_trade_tracker['count']}"
+          f"{f'/{MAX_TRADES_PER_DAY}' if not DRY_RUN else ' (no daily cap in DRY_RUN)'}")
 
     if bot_paused.is_set():
         # Paused via /pause — skip opening new trades entirely this cycle,
@@ -2973,14 +2976,15 @@ def main():
     # full 15 minutes after every restart before the first snapshot.
     last_status_update_ms = 0
 
+    trade_cap_desc = f"max {MAX_TRADES_PER_DAY} trades/day" if not DRY_RUN else "no daily trade cap (DRY_RUN)"
     print(f"DRY_RUN = {DRY_RUN}. Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)}. "
-          f"Max {MAX_TRADES_PER_DAY} trades/day. "
+          f"{trade_cap_desc}. "
           f"Starting scan loop every {POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.")
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
         f"Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)} "
-        f"({'resistance/RSI(77) SHORT-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 SHORT+LONG'}).\n"
-        f"Scanning every {POLL_INTERVAL_SECONDS}s, max {MAX_TRADES_PER_DAY} trades/day. "
+        f"({'resistance/RSI(77) SHORT-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 on 1h SHORT+LONG'}).\n"
+        f"Scanning every {POLL_INTERVAL_SECONDS}s, {trade_cap_desc}. "
         f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s. "
         f"Heartbeat every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.\n"
         f"Tap ❌ Close under any position in a status update to close it instantly.\n"
