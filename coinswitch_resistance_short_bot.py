@@ -232,7 +232,9 @@ KLINE_INTERVAL = "5"                  # minutes; "5" = 5m candles
 RESISTANCE_LOOKBACK_CANDLES = 150     # ~12.5 hours of 5m candles
 PIVOT_WING = 3                        # candles on each side to confirm a swing high
 RESISTANCE_TOLERANCE_PCT = 0.4        # "at resistance" = within this % of a swing-high cluster
-REQUIRE_REJECTION_CANDLE = True       # also require the latest candle to show a rejection wick
+REQUIRE_REJECTION_CANDLE = True       # Strategy 1 only — also require the latest candle to show a
+                                       # rejection wick before shorting. Strategy 3 (below) skips this
+                                       # requirement and shorts as soon as price touches the level.
 
 # Rule: only short if volume is FADING as price pushes up into the resistance
 # level, not rising into it. Rising volume into a level more often precedes a
@@ -290,20 +292,48 @@ STRATEGY2_TP_CAPITAL_PCT = 1.0        # target: 1% profit on capital employed (n
 STRATEGY2_KLINE_INTERVAL = "60"       # minutes; "60" = 1h candles (strategy 1 stays on 5m, unchanged)
 STRATEGY2_LOOKBACK_CANDLES = 100      # ~4 days of 1h candles — plenty for a 14-period RSI
 
-# Which strategy is currently allowed to open NEW trades: "1" or "2". Read
-# from env as the default on a fresh deploy, then overridable live via
-# /strategy1 /strategy2 in Telegram and persisted across restarts in the
-# state file (see save_state/load_state and strategy_state below) — the env
-# var only matters until the first Telegram switch or a saved state file is found.
+# ============================ STRATEGY 3 (resistance, no confirmation) ======
+# A third, separate strategy. Same base screening (rules 1-3, identical to
+# strategy 1: not top-100, down >5% in 24h, >10cr INR volume) and the same
+# resistance-level detection (find_resistance_levels() / is_at_resistance()),
+# but two differences from strategy 1's path 4a:
+#   - Does NOT require a confirmed rejection candle (has_rejection_candle())
+#     before entering — shorts as soon as price is within
+#     RESISTANCE_TOLERANCE_PCT of a detected level, one candle earlier than
+#     strategy 1 would.
+#   - Actually places a SHORT (SELL) on trigger, unlike strategy 1's
+#     enter_trades_strategy1(), which places a LONG (BUY) despite the
+#     resistance/RSI-overbought signal being a short setup.
+# Strategy 3 does NOT use the RSI-overbought path (4b) — resistance-only.
+# Volume-decline filtering is still applied (STRATEGY3_REQUIRE_DECLINING_VOLUME),
+# using the same REQUIRE_DECLINING_VOLUME thresholds/lookback as strategy 1.
+# Take-profit and leverage/sizing rules are identical in shape to strategy 1's
+# (same DESIRED_LEVERAGE, same CAPITAL_INR per trade), just its own % target.
+STRATEGY3_ENABLED = True
+STRATEGY3_REQUIRE_DECLINING_VOLUME = True   # set False to also skip the volume-decline filter
+STRATEGY3_TP_CAPITAL_PCT = 5.0        # target: 5% profit on capital employed, same style as TP_CAPITAL_PCT
+
+# Which strategy is currently allowed to open NEW trades: "1", "2", or "3".
+# Read from env as the default on a fresh deploy, then overridable live via
+# /strategy1 /strategy2 /strategy3 in Telegram and persisted across restarts
+# in the state file (see save_state/load_state and strategy_state below) —
+# the env var only matters until the first Telegram switch or a saved state
+# file is found.
 ACTIVE_STRATEGY_DEFAULT = os.environ.get("ACTIVE_STRATEGY", "1").strip()
-if ACTIVE_STRATEGY_DEFAULT not in ("1", "2"):
+if ACTIVE_STRATEGY_DEFAULT not in ("1", "2", "3"):
     ACTIVE_STRATEGY_DEFAULT = "1"
 
 # Mutable "which strategy is active" holder, guarded by state_lock same as
-# open_shorts/daily_trade_tracker (telegram_polling_loop's /strategy1 and
-# /strategy2 handlers mutate this from a different thread than the scan
-# loop reads it from).
+# open_shorts/daily_trade_tracker (telegram_polling_loop's /strategy1,
+# /strategy2, /strategy3 handlers mutate this from a different thread than
+# the scan loop reads it from).
 strategy_state = {"active": ACTIVE_STRATEGY_DEFAULT}
+
+STRATEGY_NAMES = {
+    "1": "resistance/RSI(77) LONG-only",
+    "2": "RSI(14) 80/20 on 1h SHORT+LONG",
+    "3": "resistance touch, no rejection-candle wait, SHORT-only",
+}
 
 # =============================================================================
 
@@ -680,13 +710,17 @@ def get_realized_pnl(symbol, from_time_ms):
     return total
 
 
-def get_account_transactions(from_time_ms=None, to_time_ms=None, limit=1000):
+def get_account_transactions(from_time_ms=None, to_time_ms=None, limit=100):
     """Fetches every balance-affecting transaction on the futures account
     (across all symbols) — trading fees (COMMISSION), funding payments
     (FUNDING_FEE), realized P&L (P&L), liquidation fees (LIQUIDATION_FEE),
     and margin top-ups (ADD_MARGIN) — per CoinSwitch's Get Transactions
     endpoint. No 'type' filter is passed, so all of the above come back
     together in one call; summarize_fees_and_pnl() below buckets them.
+
+    limit defaults to 100 rather than a large round number — CoinSwitch
+    doesn't publish a max for this param, and a too-high value was
+    observed to make the whole request come back 400 Bad Request.
 
     from_time_ms/to_time_ms omitted entirely means "no bound on that side" —
     used for the /fees command's all-time totals."""
@@ -697,7 +731,14 @@ def get_account_transactions(from_time_ms=None, to_time_ms=None, limit=1000):
         params["to_time"] = to_time_ms
     headers, path = sign_request("GET", "/trade/api/v2/futures/transactions", params)
     r = requests.get(BASE_URL + path, headers=headers, timeout=15)
-    r.raise_for_status()
+    if not r.ok:
+        # raise_for_status() alone drops the response body, which is where
+        # CoinSwitch actually explains *why* a 400 happened — surface it so
+        # /fees's error message (and the logs) show the real reason instead
+        # of a bare "400 Client Error: Bad Request for url: ...".
+        raise RuntimeError(
+            f"CoinSwitch Get Transactions failed: HTTP {r.status_code}, body: {r.text}"
+        )
     return r.json()["data"]
 
 
@@ -886,7 +927,41 @@ def place_order(symbol, side, order_type, quantity, price=None,
         return r.json()
 
 
-# ------------------------------ Screener step ---------------------------------
+def cancel_order(symbol, order_id, max_retries=2, retry_delay_seconds=2.0):
+    """Cancels a resting order (used to replace an existing TP or SL order
+    when the user manually changes one via /tp or /sl).
+
+    NOTE: same caveat as elsewhere in this file (see get_realized_pnl /
+    recover_open_positions) — the exact cancel endpoint/method/body shape
+    below is my best guess at CoinSwitch's REST convention (DELETE to the
+    same /futures/order path, order_id + symbol + exchange in the body),
+    NOT verified against their live API docs. Test this against a real
+    (small) order before relying on it — if it 404s or the body shape is
+    wrong, /tp and /sl will fail to replace the old order on a live
+    position and you'll end up with two resting orders on the same
+    symbol. Safe to ignore in DRY_RUN, which never reaches the network."""
+    if DRY_RUN or order_id in (None, "DRY-RUN"):
+        print(f"    [DRY RUN] would DELETE /futures/order -> {{'symbol': {symbol!r}, "
+              f"'order_id': {order_id!r}}}")
+        return {"data": {"order_id": order_id, "status": "DRY_RUN"}}
+
+    body = {"exchange": EXCHANGE, "symbol": symbol, "order_id": order_id}
+    headers, path = sign_request("DELETE", "/trade/api/v2/futures/order")
+    for attempt in range(max_retries + 1):
+        r = requests.delete(BASE_URL + path, headers=headers, json=body, timeout=15)
+        if r.status_code == 429 and attempt < max_retries:
+            wait = retry_delay_seconds * (2 ** attempt)
+            print(f"  [order] rate-limited (429) cancelling order for {symbol}, retrying in {wait:.1f}s...")
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            # Already filled/cancelled — not an error for our purposes, the
+            # caller just wants it gone before placing the replacement.
+            print(f"  [order] cancel for {symbol} order {order_id} got 404 — "
+                  f"already gone, treating as cancelled.")
+            return {"data": {"order_id": order_id, "status": "ALREADY_GONE"}}
+        r.raise_for_status()
+        return r.json()
 
 def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
     """Apply rules 1-3: not top-100 cap, down >5% in 24h, >10cr INR volume."""
@@ -1027,11 +1102,24 @@ def is_volume_declining(candles, lookback=VOLUME_DECLINE_LOOKBACK_CANDLES,
     return decline_pct >= min_decline_pct
 
 
-def evaluate_resistance(symbol, current_price, candles=None):
+def evaluate_resistance(symbol, current_price, candles=None,
+                         require_rejection_candle=None, require_declining_volume=None):
     """candles can be passed in (e.g. already fetched by the caller for the
     RSI check below) to avoid a second, redundant get_klines() call for the
     same symbol in the same scan cycle. If omitted, fetches them itself like
-    before."""
+    before.
+
+    require_rejection_candle / require_declining_volume default to the
+    module-level REQUIRE_REJECTION_CANDLE / REQUIRE_DECLINING_VOLUME (i.e.
+    strategy 1's behavior) when left as None. Strategy 3 passes its own
+    STRATEGY3_REQUIRE_DECLINING_VOLUME and require_rejection_candle=False so
+    it can short on a bare touch of the level without waiting for a
+    confirmed rejection candle, while strategy 1's calls (which don't pass
+    these) are completely unaffected."""
+    if require_rejection_candle is None:
+        require_rejection_candle = REQUIRE_REJECTION_CANDLE
+    if require_declining_volume is None:
+        require_declining_volume = REQUIRE_DECLINING_VOLUME
     if candles is None:
         candles = get_klines(symbol)
     if len(candles) < (2 * PIVOT_WING + 5):
@@ -1040,9 +1128,9 @@ def evaluate_resistance(symbol, current_price, candles=None):
     hit = is_at_resistance(current_price, levels)
     if hit is None:
         return None
-    if REQUIRE_REJECTION_CANDLE and not has_rejection_candle(candles):
+    if require_rejection_candle and not has_rejection_candle(candles):
         return None
-    if REQUIRE_DECLINING_VOLUME:
+    if require_declining_volume:
         # Only a confirmed False (volume readable and NOT declining) blocks
         # the trade. None (unreadable/insufficient data) falls through and
         # behaves like this check never existed, per your instruction not to
@@ -1254,7 +1342,7 @@ def load_state():
         with open(STATE_FILE_PATH, "r") as f:
             payload = json.load(f)
         saved_strategy = payload.get("active_strategy")
-        if saved_strategy in ("1", "2"):
+        if saved_strategy in ("1", "2", "3"):
             strategy_state["active"] = saved_strategy
             print(f"  [state] restored active strategy from saved state: strategy {saved_strategy}")
         return payload.get("open_shorts") or {}, payload.get("daily_trade_tracker")
@@ -1325,6 +1413,13 @@ def recover_open_positions(instruments, daily_trade_tracker):
         # that's the correct default, not a guess.
         pos.setdefault("side", "SHORT")
         pos.setdefault("strategy", "1")
+        # Backfill for state saved before /tp and /sl (manual TP/SL editing)
+        # existed — no stop-loss and no known TP order id for these older
+        # positions.
+        pos.setdefault("tp_order_id", None)
+        pos.setdefault("sl_price", None)
+        pos.setdefault("sl_order_id", None)
+        pos.setdefault("price_precision", 4)
     if recovered:
         print(f"  [state] restored {len(recovered)} simulated (DRY RUN) open short(s) "
               f"from saved state: {', '.join(recovered.keys())}")
@@ -1393,20 +1488,33 @@ def recover_open_positions(instruments, daily_trade_tracker):
             saved = state_open_shorts.get(symbol)
             if saved and not saved.get("simulated"):
                 tp_price = saved.get("tp_price")
+                tp_order_id = saved.get("tp_order_id")
+                sl_price = saved.get("sl_price")
+                sl_order_id = saved.get("sl_order_id")
+                price_precision = saved.get("price_precision", 4)
                 opened_at_ms = saved.get("opened_at_ms", int(time.time() * 1000))
                 liquidation_warning_sent = saved.get("liquidation_warning_sent", False)
                 # Saved state (if any) knows which strategy actually opened
                 # this position; trust that over guessing. If there's no
                 # matching saved entry (e.g. state file lost), fall back to
-                # inferring from direction — strategy 1 has only ever opened
-                # SHORTs, so a recovered LONG with no saved match must be
-                # strategy 2's.
-                strategy = saved.get("strategy") or ("2" if live_side == "LONG" else "1")
+                # inferring from direction — but this is now ambiguous for
+                # SHORTs, since both strategy 2 (RSI>80) and strategy 3
+                # (resistance touch) open SHORTs. LONG still narrows cleanly
+                # to strategy 1 (bug: opens LONG despite the short setup) or
+                # strategy 2 (RSI<20). Defaulting a directionless-tiebreak
+                # SHORT to "2" here; this only affects LIVE (non-simulated)
+                # positions recovered with no matching state-file entry — a
+                # rare edge case, not the normal path.
+                strategy = saved.get("strategy") or "2"
             else:
                 tp_price = None
+                tp_order_id = None
+                sl_price = None
+                sl_order_id = None
+                price_precision = 4
                 opened_at_ms = int(time.time() * 1000)  # true entry time unknown otherwise
                 liquidation_warning_sent = False
-                strategy = "2" if live_side == "LONG" else "1"
+                strategy = "2"  # directionless tiebreak, same rationale as above
 
             # Leverage actually set on the exchange for a position opened
             # before this restart isn't returned consistently by every
@@ -1433,6 +1541,10 @@ def recover_open_positions(instruments, daily_trade_tracker):
                 "entry_price": entry_price,   # may be None if the field name didn't match — logged below either way
                 "qty": qty,
                 "tp_price": tp_price,
+                "tp_order_id": tp_order_id,
+                "sl_price": sl_price,
+                "sl_order_id": sl_order_id,
+                "price_precision": price_precision,
                 "opened_at_ms": opened_at_ms,
                 "simulated": False,           # always a real exchange position, regardless of today's DRY_RUN setting
                 "leverage": leverage,
@@ -1519,10 +1631,11 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
 
         if is_simulated:
             # No real order was placed, so there's no real position to poll.
-            # We simulate the only exit this bot ever places — the take-profit
-            # limit — by checking whether the live price has reached it.
-            # (No stop-loss is set, by design, so this is the sole exit we
-            # can simulate; a DRY RUN short can otherwise stay open forever.)
+            # We simulate the two exits this bot can produce for a DRY_RUN
+            # position — the take-profit limit, and (if manually set via
+            # /sl) a stop-loss — by checking whether the live price has
+            # reached either one. With no SL set, a DRY RUN short can
+            # otherwise stay open forever.
             t = tickers.get(symbol)
             if t is None:
                 continue
@@ -1531,6 +1644,19 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             except (KeyError, ValueError):
                 continue
             side = pos.get("side", "SHORT")
+            sl_price = pos.get("sl_price")
+            if sl_price is not None:
+                sl_hit = (
+                    last_price >= sl_price if side == "SHORT"
+                    else last_price <= sl_price
+                )
+                if sl_hit:
+                    pnl = (
+                        (pos["entry_price"] - sl_price) * pos["qty"] if side == "SHORT"
+                        else (sl_price - pos["entry_price"]) * pos["qty"]
+                    )
+                    closed.append((symbol, pnl, pos, "stop_loss"))
+                    continue  # don't also check TP this cycle — one exit per position
             if pos["tp_price"] is not None:
                 tp_hit = (
                     last_price <= pos["tp_price"] if side == "SHORT"
@@ -1788,10 +1914,16 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
                 emoji = "🟢" if unrealized > 0 else ("🔴" if unrealized < 0 else "⚪")
                 total_unrealized += unrealized
                 priced_count += 1
+                tp_price = pos.get("tp_price")
+                sl_price = pos.get("sl_price")
+                tp_sl_desc = (
+                    f"  TP {tp_price if tp_price is not None else '—'} / "
+                    f"SL {sl_price if sl_price is not None else '—'}"
+                )
                 lines.append(
                     f"{emoji} {symbol} [{side}/S{strategy}]{' [DRY RUN]' if pos.get('simulated') else ''}: "
                     f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
-                    f"entry {entry_price} -> now {current_price}"
+                    f"entry {entry_price} -> now {current_price}{tp_sl_desc}"
                 )
         # One button per position regardless of whether it priced this cycle —
         # you should always be able to close a stuck/unpriced position too.
@@ -1838,6 +1970,7 @@ def send_daily_summary(daily_trade_tracker, open_shorts):
         )
     except Exception as e:
         print(f"  [daily summary] couldn't fetch fee breakdown ({e}), omitting it from today's summary.")
+        fees_line = f"⚠️ Fee/P&L breakdown unavailable ({e})\n"
 
     msg = (
         f"{emoji} {'[DRY RUN] ' if DRY_RUN else ''}Daily summary — {daily_trade_tracker['date']}\n"
@@ -1947,6 +2080,155 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
     )
 
 
+def set_take_profit_manual(symbol, open_shorts, daily_trade_tracker, new_tp_price):
+    """Handles /tp SYMBOL PRICE — replaces the resting take-profit order
+    (live) or just updates the tracked tp_price (DRY_RUN — checked against
+    the live price every cycle in reconcile_open_shorts()) for one open
+    position. Caller (telegram_polling_loop) MUST already hold state_lock,
+    same requirement as close_position_manual().
+
+    A price of 0 (or any non-positive number) removes the take-profit
+    entirely — cancels the resting order (live) and leaves the position
+    with no automatic profit exit, same as TP_CAPITAL_PCT=0 would at entry.
+    Returns (ok: bool, message: str) — caller sends the message to Telegram."""
+    pos = open_shorts.get(symbol)
+    if pos is None:
+        return False, f"⚠️ No open position found for {symbol} (already closed?)."
+
+    side = pos.get("side", "SHORT")
+    entry_price = pos.get("entry_price")
+    is_simulated = pos.get("simulated", DRY_RUN)
+
+    if new_tp_price <= 0:
+        old_order_id = pos.get("tp_order_id")
+        if old_order_id and not is_simulated:
+            try:
+                cancel_order(symbol, old_order_id)
+            except Exception as e:
+                return False, f"⚠️ Failed to cancel existing TP order for {symbol}: {e}"
+        pos["tp_price"] = None
+        pos["tp_order_id"] = None
+        save_state(open_shorts, daily_trade_tracker)
+        return True, f"✅ Take-profit removed for {symbol}. No automatic profit exit is set now."
+
+    # Sanity check: a take-profit belongs on the profit side of entry, not
+    # the loss side — catches an obvious fat-finger (e.g. price on the wrong
+    # side, or SL/TP swapped) before it does something surprising.
+    if entry_price is not None:
+        if side == "SHORT" and new_tp_price >= entry_price:
+            return False, (
+                f"⚠️ {symbol} is SHORT (entry {entry_price}) — a take-profit at "
+                f"{new_tp_price} is at/above entry, which is a LOSS level for a short, "
+                f"not a profit level. Did you mean /sl {symbol} {new_tp_price}?"
+            )
+        if side == "LONG" and new_tp_price <= entry_price:
+            return False, (
+                f"⚠️ {symbol} is LONG (entry {entry_price}) — a take-profit at "
+                f"{new_tp_price} is at/below entry, which is a LOSS level for a long, "
+                f"not a profit level. Did you mean /sl {symbol} {new_tp_price}?"
+            )
+
+    price_precision = pos.get("price_precision", 4)
+    new_tp_price = round(new_tp_price, price_precision)
+
+    old_order_id = pos.get("tp_order_id")
+    if old_order_id and not is_simulated:
+        try:
+            cancel_order(symbol, old_order_id)
+        except Exception as e:
+            return False, f"⚠️ Failed to cancel existing TP order for {symbol}: {e}"
+
+    close_side = "BUY" if side == "SHORT" else "SELL"  # closing a SHORT buys it back, closing a LONG sells it
+    try:
+        tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
+                               quantity=pos["qty"], price=new_tp_price, reduce_only=True)
+    except Exception as e:
+        return False, f"⚠️ Failed to place new TP order for {symbol}: {e}"
+
+    pos["tp_price"] = new_tp_price
+    pos["tp_order_id"] = tp_resp["data"].get("order_id")
+    save_state(open_shorts, daily_trade_tracker)
+    return True, f"✅ Take-profit for {symbol} updated to {new_tp_price}."
+
+
+def set_stop_loss_manual(symbol, open_shorts, daily_trade_tracker, new_sl_price):
+    """Handles /sl SYMBOL PRICE — places or replaces a stop-loss trigger
+    order (live) or just updates the tracked sl_price (DRY_RUN — checked
+    against the live price every cycle in reconcile_open_shorts()) for one
+    open position. Caller MUST already hold state_lock, same as
+    close_position_manual().
+
+    NOTE on the live order: same "best guess, unverified against CoinSwitch's
+    live API docs" caveat as cancel_order() applies to order_type="STOP_MARKET"
+    + trigger_price below. Test against a real (small) position before relying
+    on this unattended — if the order_type name is wrong, the call will fail
+    loudly (you'll get the error back in Telegram) rather than silently doing
+    nothing, but confirm it actually behaves like a stop before trusting it.
+
+    A price of 0 (or any non-positive number) removes the stop-loss —
+    cancels the resting trigger order (live) and goes back to no stop-loss
+    at all, same as this bot's original default. Returns (ok: bool, message:
+    str) — caller sends the message to Telegram."""
+    pos = open_shorts.get(symbol)
+    if pos is None:
+        return False, f"⚠️ No open position found for {symbol} (already closed?)."
+
+    side = pos.get("side", "SHORT")
+    entry_price = pos.get("entry_price")
+    is_simulated = pos.get("simulated", DRY_RUN)
+
+    if new_sl_price <= 0:
+        old_order_id = pos.get("sl_order_id")
+        if old_order_id and not is_simulated:
+            try:
+                cancel_order(symbol, old_order_id)
+            except Exception as e:
+                return False, f"⚠️ Failed to cancel existing SL order for {symbol}: {e}"
+        pos["sl_price"] = None
+        pos["sl_order_id"] = None
+        save_state(open_shorts, daily_trade_tracker)
+        return True, f"✅ Stop-loss removed for {symbol}. This position now has no stop-loss."
+
+    # Sanity check: a stop-loss belongs on the loss side of entry — catches
+    # an obvious fat-finger before it creates a "stop" that would actually
+    # close the position at a profit the instant it's placed.
+    if entry_price is not None:
+        if side == "SHORT" and new_sl_price <= entry_price:
+            return False, (
+                f"⚠️ {symbol} is SHORT (entry {entry_price}) — a stop-loss at "
+                f"{new_sl_price} is at/below entry, which would trigger a PROFIT close, "
+                f"not protect against a loss. Did you mean /tp {symbol} {new_sl_price}?"
+            )
+        if side == "LONG" and new_sl_price >= entry_price:
+            return False, (
+                f"⚠️ {symbol} is LONG (entry {entry_price}) — a stop-loss at "
+                f"{new_sl_price} is at/above entry, which would trigger a PROFIT close, "
+                f"not protect against a loss. Did you mean /tp {symbol} {new_sl_price}?"
+            )
+
+    price_precision = pos.get("price_precision", 4)
+    new_sl_price = round(new_sl_price, price_precision)
+
+    old_order_id = pos.get("sl_order_id")
+    if old_order_id and not is_simulated:
+        try:
+            cancel_order(symbol, old_order_id)
+        except Exception as e:
+            return False, f"⚠️ Failed to cancel existing SL order for {symbol}: {e}"
+
+    close_side = "BUY" if side == "SHORT" else "SELL"  # closing a SHORT buys it back, closing a LONG sells it
+    try:
+        sl_resp = place_order(symbol, side=close_side, order_type="STOP_MARKET",
+                               quantity=pos["qty"], trigger_price=new_sl_price, reduce_only=True)
+    except Exception as e:
+        return False, f"⚠️ Failed to place stop-loss order for {symbol}: {e}"
+
+    pos["sl_price"] = new_sl_price
+    pos["sl_order_id"] = sl_resp["data"].get("order_id")
+    save_state(open_shorts, daily_trade_tracker)
+    return True, f"✅ Stop-loss for {symbol} set to {new_sl_price}."
+
+
 def send_help_message():
     """Handles the /help (and /commands) command — sends a plain-text list of
     every command this bot understands, so you don't have to remember them or
@@ -1961,9 +2243,12 @@ def send_help_message():
         "/fees — brokerage (commission), funding fees, and net P&L after fees (today + all-time)",
         f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
+        "/tp SYMBOL PRICE — change the take-profit for an open position (0 removes it)",
+        "/sl SYMBOL PRICE — set/change the stop-loss for an open position (0 removes it)",
         "/strategy — show which strategy is currently active for new trades",
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
+        "/strategy3 — switch to Strategy 3 (resistance touch, no rejection-candle wait, SHORT-only)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
@@ -2198,7 +2483,9 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
         return
 
     print("  [telegram] listening for 'Close' taps and /status, /history, /analytics, /fees, "
-          "/cooldowns, /debugvolume, /strategy, /strategy1, /strategy2, /pause, /resume, /help commands...")
+          "/cooldowns, /debugvolume, /tp, /sl, /strategy, /strategy1, /strategy2, /strategy3, "
+          "/pause, /resume, "
+          "/help commands...")
     offset = None
     while True:
         try:
@@ -2268,6 +2555,32 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         except Exception as e:
                             print(f"  [telegram] /debugvolume failed unexpectedly: {e}")
                             send_telegram_message(f"⚠️ /debugvolume failed unexpectedly: {e}")
+                elif text.startswith("/tp") or text.startswith("/sl"):
+                    parts = text.split()
+                    cmd_name = parts[0].lstrip("/")  # "tp" or "sl"
+                    if len(parts) < 3:
+                        send_telegram_message(
+                            f"Usage: /{cmd_name} SYMBOL PRICE  (e.g. /{cmd_name} dogeusdt 0.1523)\n"
+                            f"Price 0 removes the {'take-profit' if cmd_name == 'tp' else 'stop-loss'}."
+                        )
+                    else:
+                        symbol = parts[1].upper()
+                        try:
+                            new_price = float(parts[2])
+                        except ValueError:
+                            send_telegram_message(f"⚠️ {parts[2]!r} doesn't look like a number.")
+                        else:
+                            print(f"  [telegram] /{cmd_name} {symbol} {new_price} requested")
+                            with state_lock:
+                                try:
+                                    handler = set_take_profit_manual if cmd_name == "tp" else set_stop_loss_manual
+                                    ok, msg = handler(symbol, open_shorts, daily_trade_tracker, new_price)
+                                    send_telegram_message(msg)
+                                    if not ok:
+                                        print(f"  [telegram] /{cmd_name} {symbol} rejected: {msg}")
+                                except Exception as e:
+                                    print(f"  [telegram] /{cmd_name} {symbol} failed unexpectedly: {e}")
+                                    send_telegram_message(f"⚠️ /{cmd_name} {symbol} failed unexpectedly: {e}")
                 elif text == "/pause":
                     if bot_paused.is_set():
                         send_telegram_message("⏸ Already paused — no new trades are being opened.")
@@ -2285,8 +2598,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         bot_paused.clear()
                         print("  [telegram] /resume — new entries re-enabled")
                         send_telegram_message("▶️ Resumed. Scanning for new entries again.")
-                elif text in ("/strategy1", "/strategy2"):
-                    requested = text[-1]  # "1" or "2"
+                elif text in ("/strategy1", "/strategy2", "/strategy3"):
+                    requested = text[-1]  # "1", "2", or "3"
                     with state_lock:
                         current = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
                         if current == requested:
@@ -2295,11 +2608,10 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                             strategy_state["active"] = requested
                             save_state(open_shorts, daily_trade_tracker)
                             print(f"  [telegram] switched active strategy: {current} -> {requested}")
-                            name = ("resistance/RSI(77) LONG-only" if requested == "1"
-                                    else "RSI(14) 80/20 on 1h SHORT+LONG")
+                            name = STRATEGY_NAMES[requested]
                             send_telegram_message(
                                 f"🔀 Switched to Strategy {requested} ({name}) for NEW trades.\n"
-                                f"Any positions already open (from either strategy) keep being "
+                                f"Any positions already open (from any strategy) keep being "
                                 f"monitored and closed normally — this only changes what gets "
                                 f"entered going forward."
                             )
@@ -2310,7 +2622,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         f"Active strategy: {current}\n"
                         f"1 = resistance/RSI(77) LONG-only\n"
                         f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
-                        f"Switch with /strategy1 or /strategy2."
+                        f"3 = resistance touch, no rejection-candle wait, SHORT-only\n"
+                        f"Switch with /strategy1, /strategy2, or /strategy3."
                     )
                 elif text in ("/help", "/commands"):
                     print("  [telegram] /help requested")
@@ -2582,7 +2895,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
             f"24h: {cand['pct_change_24h']:.2f}%  |  Signal: {signal_reason}"
             f"{f' (RSI {rsi_value:.1f})' if rsi_triggered and resistance is not None else ''}\n"
-            f"No stop-loss set on this position."
+            f"No stop-loss set on this position. Use /sl {symbol} PRICE to set one, /tp {symbol} PRICE to change the take-profit."
         )
         send_telegram_message(entry_msg)
 
@@ -2590,10 +2903,12 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         # THIS trade's actual leverage (which may be below DESIRED_LEVERAGE).
         tp_price_pct = TP_CAPITAL_PCT / leverage
         tp_price = cand["last_price"]
+        tp_order_id = None
         if TP_CAPITAL_PCT > 0:
             tp_price = round(cand["last_price"] * (1 + tp_price_pct / 100), price_precision)
             tp_resp = place_order(symbol, side="SELL", order_type="LIMIT",
                                    quantity=qty, price=tp_price, reduce_only=True)
+            tp_order_id = tp_resp["data"].get("order_id")
             print(f"      take-profit @ {tp_price} "
                   f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
             send_telegram_message(
@@ -2606,6 +2921,10 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
                 "entry_price": cand["last_price"],
                 "qty": qty,
                 "tp_price": tp_price,
+                "tp_order_id": tp_order_id,
+                "sl_price": None,               # no stop-loss by default — set manually via /sl
+                "sl_order_id": None,
+                "price_precision": price_precision,  # needed to round /tp and /sl prices consistently
                 "opened_at_ms": opened_at_ms,
                 "simulated": DRY_RUN,
                 "leverage": leverage,                  # needed for the liquidation-distance estimate below
@@ -2728,7 +3047,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
             f"Signal: RSI {rsi_value:.1f} on 1h chart\n"
-            f"No stop-loss set on this position."
+            f"No stop-loss set on this position. Use /sl {symbol} PRICE to set one, /tp {symbol} PRICE to change the take-profit."
         )
         send_telegram_message(entry_msg)
 
@@ -2740,6 +3059,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
         # long exits above entry).
         tp_price_pct = STRATEGY2_TP_CAPITAL_PCT / leverage
         tp_price = cand["last_price"]
+        tp_order_id = None
         if STRATEGY2_TP_CAPITAL_PCT > 0:
             if side == "SHORT":
                 tp_price = round(cand["last_price"] * (1 - tp_price_pct / 100), price_precision)
@@ -2749,6 +3069,7 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
                 tp_close_side = "SELL"
             tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
                                    quantity=qty, price=tp_price, reduce_only=True)
+            tp_order_id = tp_resp["data"].get("order_id")
             print(f"      take-profit @ {tp_price} "
                   f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
             send_telegram_message(
@@ -2761,12 +3082,161 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
                 "entry_price": cand["last_price"],
                 "qty": qty,
                 "tp_price": tp_price,
+                "tp_order_id": tp_order_id,
+                "sl_price": None,               # no stop-loss by default — set manually via /sl
+                "sl_order_id": None,
+                "price_precision": price_precision,
                 "opened_at_ms": opened_at_ms,
                 "simulated": DRY_RUN,
                 "leverage": leverage,
                 "liquidation_warning_sent": False,
                 "side": side,
                 "strategy": "2",
+            }
+            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
+            save_state(open_shorts, daily_trade_tracker)
+
+    return available_balance_usdt
+
+
+def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available_balance_usdt,
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+    """Strategy 3's entry loop. `candidates` uses the exact same screening as
+    strategy 1 (screen_candidates(): not top-100, down >5% in 24h, >10cr INR
+    volume). Signal is resistance-only (no RSI path) on the 5m chart, same
+    level detection as strategy 1 (find_resistance_levels() / is_at_resistance()
+    via evaluate_resistance()), but:
+        - does NOT require a confirmed rejection candle — shorts as soon as
+          price is within RESISTANCE_TOLERANCE_PCT of a detected level
+        - DOES actually place a SHORT (SELL), unlike strategy 1's LONG bug
+    Volume-decline filtering still applies per STRATEGY3_REQUIRE_DECLINING_VOLUME.
+    Leverage resolution, the daily trade cap, the re-entry cooldown, and
+    wallet-balance gating all reuse the exact same mechanisms strategy 1 and
+    2 use, for consistent risk/pacing across all three strategies."""
+    for cand in candidates:
+        symbol = cand["symbol"]
+        if symbol in open_shorts:
+            continue
+        last_entry_ms = daily_trade_tracker["recent_entries"].get(symbol)
+        if last_entry_ms is not None and last_entry_ms >= cooldown_cutoff_ms:
+            hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but was entered within the last "
+                  f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
+            continue
+        if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
+            print("  Daily trade limit reached, no further entries until tomorrow.")
+            break
+        if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+            print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is now below "
+                  f"the {order_margin_usdt:.2f} USDT needed for another trade — stopping new "
+                  f"entries for this cycle.")
+            break
+
+        time.sleep(2.1)  # same KLines rate-limit pacing as strategies 1 and 2
+
+        try:
+            candles = get_klines(symbol)  # 5m chart, same interval as strategy 1
+        except requests.HTTPError as e:
+            print(f"  {symbol}: klines fetch failed ({e}), skipping.")
+            continue
+
+        resistance = evaluate_resistance(
+            symbol, cand["last_price"], candles=candles,
+            require_rejection_candle=False,
+            require_declining_volume=STRATEGY3_REQUIRE_DECLINING_VOLUME,
+        )
+        if resistance is None:
+            continue
+
+        print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
+              f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
+              f"price {cand['last_price']}, resistance ~{resistance:.6g} "
+              f"(touch, no rejection-candle confirmation) — [Strategy 3] SHORT signal")
+
+        instrument = instruments.get(symbol)
+        if instrument is None:
+            print(f"      no instrument info for {symbol}, skipping order.")
+            continue
+
+        leverage = resolve_leverage(instrument)
+        if leverage < DESIRED_LEVERAGE:
+            print(f"      {symbol}: {DESIRED_LEVERAGE}x not available, using max {leverage}x instead.")
+        elif leverage > DESIRED_LEVERAGE:
+            print(f"      {symbol}: this symbol's own minimum leverage ({leverage}x) is above "
+                  f"{DESIRED_LEVERAGE}x — trading at {leverage}x instead, which is MORE leverage "
+                  f"than desired. Consider skipping this symbol if that's not acceptable.")
+        set_leverage(symbol, leverage)
+
+        qty = compute_quantity(cand["last_price"], order_margin_usdt, leverage, instrument)
+        price_precision = int(instrument.get("price_precision", 4))
+
+        resp = place_order(symbol, side="SELL", order_type="MARKET", quantity=qty)
+        opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP order below
+        print(f"      order response: {resp['data']}")
+        daily_trade_tracker["count"] += 1
+
+        # Same partial-fill handling as strategies 1 and 2 — size everything
+        # downstream off what actually filled, not what was requested.
+        try:
+            filled_qty = float(resp["data"].get("exec_quantity", qty))
+        except (TypeError, ValueError):
+            filled_qty = qty
+        if filled_qty <= 0:
+            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
+                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            continue
+        if filled_qty != qty:
+            print(f"      {symbol}: requested {qty}, filled {filled_qty} "
+                  f"(partial fill) — sizing take-profit off the filled amount.")
+        available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
+        qty = filled_qty
+
+        entry_msg = (
+            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 3] SHORT {symbol}\n"
+            f"Entry: {cand['last_price']} (market)\n"
+            f"Qty: {qty}  |  Leverage: {leverage}x"
+            f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
+            f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
+            f"24h: {cand['pct_change_24h']:.2f}%  |  Signal: resistance ~{resistance:.6g} "
+            f"(touch only, no rejection-candle confirmation)\n"
+            f"No stop-loss set on this position. Use /sl {symbol} PRICE to set one, /tp {symbol} PRICE to change the take-profit."
+        )
+        send_telegram_message(entry_msg)
+
+        # Take-profit: STRATEGY3_TP_CAPITAL_PCT% return on CAPITAL, same
+        # "% on capital -> % price move" conversion as strategies 1 and 2.
+        # Short exits below entry.
+        tp_price_pct = STRATEGY3_TP_CAPITAL_PCT / leverage
+        tp_price = cand["last_price"]
+        tp_order_id = None
+        if STRATEGY3_TP_CAPITAL_PCT > 0:
+            tp_price = round(cand["last_price"] * (1 - tp_price_pct / 100), price_precision)
+            tp_resp = place_order(symbol, side="BUY", order_type="LIMIT",
+                                   quantity=qty, price=tp_price, reduce_only=True)
+            tp_order_id = tp_resp["data"].get("order_id")
+            print(f"      take-profit @ {tp_price} "
+                  f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
+            send_telegram_message(
+                f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
+                f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital)"
+            )
+
+        with state_lock:
+            open_shorts[symbol] = {
+                "entry_price": cand["last_price"],
+                "qty": qty,
+                "tp_price": tp_price,
+                "tp_order_id": tp_order_id,
+                "sl_price": None,               # no stop-loss by default — set manually via /sl
+                "sl_order_id": None,
+                "price_precision": price_precision,
+                "opened_at_ms": opened_at_ms,
+                "simulated": DRY_RUN,
+                "leverage": leverage,
+                "liquidation_warning_sent": False,
+                "side": "SHORT",
+                "strategy": "3",
             }
             daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
             save_state(open_shorts, daily_trade_tracker)
@@ -2861,7 +3331,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
               f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
 
     active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
-    if active_strategy == "1":
+    if active_strategy in ("1", "3"):
         candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
         filter_desc = "market-cap/drop/volume"
     else:
@@ -2911,6 +3381,11 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # function regardless of which strategy is opening new trades right now.
     if active_strategy == "1":
         available_balance_usdt = enter_trades_strategy1(
+            candidates, instruments, order_margin_usdt, available_balance_usdt,
+            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+        )
+    elif active_strategy == "3":
+        available_balance_usdt = enter_trades_strategy3(
             candidates, instruments, order_margin_usdt, available_balance_usdt,
             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
         )
@@ -2983,7 +3458,7 @@ def main():
     send_telegram_message(
         f"{'[DRY RUN] ' if DRY_RUN else ''}Bot started. "
         f"Active strategy: {strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)} "
-        f"({'resistance/RSI(77) LONG-only' if strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT) == '1' else 'RSI(14) 80/20 on 1h SHORT+LONG'}).\n"
+        f"({STRATEGY_NAMES[strategy_state.get('active', ACTIVE_STRATEGY_DEFAULT)]}).\n"
         f"Scanning every {POLL_INTERVAL_SECONDS}s, {trade_cap_desc}. "
         f"Loss/liquidation prices re-checked every {PRICE_MONITOR_INTERVAL_SECONDS}s. "
         f"Heartbeat every {format_duration(HEARTBEAT_INTERVAL_SECONDS)}.\n"
@@ -2992,7 +3467,8 @@ def main():
         f"/analytics for win rate/profit factor/drawdown stats, "
         f"/cooldowns to see symbols on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown, "
         f"/debugvolume SYMBOL to inspect raw kline volume data, "
-        f"/strategy to check the active strategy, /strategy1 or /strategy2 to switch, "
+        f"/tp SYMBOL PRICE or /sl SYMBOL PRICE to change a position's take-profit or stop-loss (0 removes it), "
+        f"/strategy to check the active strategy, /strategy1, /strategy2, or /strategy3 to switch, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
 
