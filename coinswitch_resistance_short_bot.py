@@ -4,31 +4,31 @@ CoinSwitch PRO Futures — "Resistance Short" scanner/bot
 
 Strategy (as described by the user):
   Short a coin when ALL of the following are true:
-    1. It is NOT in the top-100 cryptos by global market cap.
+    1. It is NOT in the top-200 cryptos by global market cap.
     2. It is down more than 5% in the last 24 hours.
     3. It has more than 10 crore (10,00,00,000) INR of trading volume in the last 24 hours.
     4. EITHER of the following two independent signals (only one is needed,
        they don't stack):
-         4a. On the 5-minute chart, price is currently sitting at a
+         4a. On the 15-minute chart, price is currently sitting at a
              resistance level, confirmed by a rejection candle. Declining
              volume into the level is also checked and, when it can be read,
              must actually be declining — but if volume can't be determined
              from the candle data (e.g. the field name doesn't match), this
              check is skipped rather than blocking the trade (see
              is_volume_declining()'s True/False/None logic).
-         4b. On the 5-minute chart, RSI(14) is above 77 (see compute_rsi() /
+         4b. On the 15-minute chart, RSI(14) is above 77 (see compute_rsi() /
              RSI_OVERBOUGHT_SHORT_THRESHOLD). This path is checked entirely
              on its own — it does NOT require the resistance/rejection-
              candle/declining-volume check in 4a.
     5. The symbol hasn't already been shorted (real or DRY_RUN) in the last hour.
 
 This script:
-    - Pulls the global top-100 market-cap list from CoinGecko (free, no key needed)
+    - Pulls the global top-200 market-cap list from CoinGecko (free, no key needed)
       and excludes those symbols.
     - Pulls 24h stats for every CoinSwitch futures symbol in one call.
     - Filters by % drop and INR volume (converted from the USDT volume CoinSwitch
       reports, using a live USDT/INR rate from CoinGecko).
-    - For each surviving symbol, pulls 5m candles and looks for swing-high
+    - For each surviving symbol, pulls 15m candles and looks for swing-high
       ("pivot high") resistance levels, then checks whether the current price
       is sitting just under one of them, requiring a rejection wick AND
       declining volume into the level (see is_volume_declining()) before
@@ -48,8 +48,8 @@ IMPORTANT — read before running
       guarantee of an actual resistance level. False positives will happen,
       especially in choppy/low-liquidity charts. Always sanity-check the
       instrument list it produces.
-    - "Not in top 100 by market cap" is matched by ticker symbol against
-      CoinGecko's top 100. Ticker symbols can collide across unrelated coins
+    - "Not in top 200 by market cap" is matched by ticker symbol against
+      CoinGecko's top 200. Ticker symbols can collide across unrelated coins
       (e.g. multiple projects called "SUN"), so double check the actual name
       of anything it's about to short, not just the symbol.
     - Shorting futures uses leverage: losses can exceed your margin quickly,
@@ -223,13 +223,13 @@ EXCHANGE = "EXCHANGE_2"  # CoinSwitch futures exchange identifier — crypto per
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0", "no")
 
 # --- Screener thresholds ---
-TOP_N_MARKET_CAP_EXCLUDE = 100
+TOP_N_MARKET_CAP_EXCLUDE = 200
 MIN_24H_DROP_PCT = 5.0                # price must be down at least this much
 MIN_24H_VOLUME_INR = 10_00_00_000     # 10 crore INR
 
-# --- Resistance detection (5m chart) ---
-KLINE_INTERVAL = "5"                  # minutes; "5" = 5m candles
-RESISTANCE_LOOKBACK_CANDLES = 150     # ~12.5 hours of 5m candles
+# --- Resistance detection (15m chart) ---
+KLINE_INTERVAL = "15"                 # minutes; "15" = 15m candles
+RESISTANCE_LOOKBACK_CANDLES = 150     # ~37.5 hours of 15m candles
 PIVOT_WING = 3                        # candles on each side to confirm a swing high
 RESISTANCE_TOLERANCE_PCT = 0.4        # "at resistance" = within this % of a swing-high cluster
 REQUIRE_REJECTION_CANDLE = True       # Strategy 1 only — also require the latest candle to show a
@@ -242,23 +242,23 @@ REQUIRE_REJECTION_CANDLE = True       # Strategy 1 only — also require the lat
 # steam right at the level, which is the setup this bot is meant to catch.
 # See is_volume_declining() for exactly how "declining" is measured.
 REQUIRE_DECLINING_VOLUME = True
-VOLUME_DECLINE_LOOKBACK_CANDLES = 6   # ~30 minutes of 5m candles looked at for the volume trend
+VOLUME_DECLINE_LOOKBACK_CANDLES = 6   # ~90 minutes of 15m candles looked at for the volume trend
 VOLUME_DECLINE_MIN_PCT = 15.0         # 2nd half of that window must average at least this much
                                        # lower volume than the 1st half to count as "declining"
                                        # (a tiny/noisy dip shouldn't be enough to pass the filter)
 
-# --- RSI overbought short trigger (5m chart) ---
+# --- RSI overbought short trigger (15m chart) ---
 # A SECOND, independent entry path alongside the resistance setup above. A
-# candidate that already passed rule 1-3 screening (not top-100, down >5% in
-# 24h, >10cr INR volume) is also shorted if its 5m-candle RSI is above the
+# candidate that already passed rule 1-3 screening (not top-200, down >5% in
+# 24h, >10cr INR volume) is also shorted if its 15m-candle RSI is above the
 # threshold below — even if it never shows a confirmed resistance rejection.
 # Per your instruction: base screening still applies, but the
 # resistance/rejection-candle/declining-volume check is skipped entirely for
 # this path (see run_once(), where resistance and RSI are checked as two
 # separate ways to arrive at the same SHORT signal, not stacked together).
 RSI_SHORT_ENABLED = True
-RSI_PERIOD = 14                       # standard Wilder RSI lookback, in 5m candles
-RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest closed 5m candle triggers a short
+RSI_PERIOD = 14                       # standard Wilder RSI lookback, in 15m candles
+RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest closed 15m candle triggers a short
 
 # ============================ STRATEGY 2 (RSI 80/20) ========================
 # A second, completely separate strategy. Only one strategy is ever ACTIVE
@@ -270,9 +270,9 @@ RSI_OVERBOUGHT_SHORT_THRESHOLD = 77.0 # RSI strictly above this on the latest cl
 # of this.
 #
 # Strategy 2 rules:
-#   - Screening: ONLY "not in the top-100 by global market cap" (same list
+#   - Screening: ONLY "not in the top-200 by global market cap" (same list
 #     strategy 1 uses). No 24h-drop-%, and deliberately NO 24h-volume check
-#     (per instruction) — every non-top-100 CoinSwitch futures symbol is a
+#     (per instruction) — every non-top-200 CoinSwitch futures symbol is a
 #     candidate.
 #   - Entry, on the 1-hour chart:
 #       RSI(14) above STRATEGY2_RSI_OVERBOUGHT (80) -> SHORT
@@ -289,12 +289,12 @@ STRATEGY2_ENABLED = True
 STRATEGY2_RSI_OVERBOUGHT = 80.0       # RSI strictly above this on the 1h chart -> SHORT
 STRATEGY2_RSI_OVERSOLD = 20.0         # RSI strictly below this on the 1h chart -> LONG
 STRATEGY2_TP_CAPITAL_PCT = 1.0        # target: 1% profit on capital employed (not on leveraged notional)
-STRATEGY2_KLINE_INTERVAL = "60"       # minutes; "60" = 1h candles (strategy 1 stays on 5m, unchanged)
+STRATEGY2_KLINE_INTERVAL = "60"       # minutes; "60" = 1h candles (strategy 1 stays on 15m, unchanged)
 STRATEGY2_LOOKBACK_CANDLES = 100      # ~4 days of 1h candles — plenty for a 14-period RSI
 
 # ============================ STRATEGY 3 (resistance, no confirmation) ======
 # A third, separate strategy. Same base screening (rules 1-3, identical to
-# strategy 1: not top-100, down >5% in 24h, >10cr INR volume) and the same
+# strategy 1: not top-200, down >5% in 24h, >10cr INR volume) and the same
 # resistance-level detection (find_resistance_levels() / is_at_resistance()),
 # but two differences from strategy 1's path 4a:
 #   - Does NOT require a confirmed rejection candle (has_rejection_candle())
@@ -312,6 +312,26 @@ STRATEGY2_LOOKBACK_CANDLES = 100      # ~4 days of 1h candles — plenty for a 1
 STRATEGY3_ENABLED = True
 STRATEGY3_REQUIRE_DECLINING_VOLUME = True   # set False to also skip the volume-decline filter
 STRATEGY3_TP_CAPITAL_PCT = 5.0        # target: 5% profit on capital employed, same style as TP_CAPITAL_PCT
+
+# Two-candle confirmation (replaces the old bare-touch entry):
+#   Candle N:   crosses/touches a resistance level (its high reaches the
+#               level) but CLOSES below it -> arms a pending confirmation
+#               for that symbol/level, does NOT enter yet.
+#   Candle N+1: the very next closed 15m candle for that symbol also closes
+#               below the SAME level -> confirmed, enter SHORT this cycle.
+# If candle N+1 closes back above the level (or a gap in candle history
+# means it isn't really the immediate next candle), the pending confirmation
+# is discarded rather than entering. See get_strategy3_confirmed_resistance()
+# and strategy3_pending_confirmation below.
+STRATEGY3_REQUIRE_TWO_CANDLE_CONFIRMATION = True
+
+# symbol -> {"level": float, "candle_ts": <last confirmed candle's start_time>}
+# Only ever touched by the main scan-loop thread (enter_trades_strategy3()),
+# not by telegram_polling_loop, so unlike open_shorts/daily_trade_tracker it
+# doesn't need state_lock. Persisted in the state file (see save_state/
+# load_state) purely so a restart between candle N and candle N+1 doesn't
+# silently drop an in-progress confirmation.
+strategy3_pending_confirmation = {}
 
 # Which strategy is currently allowed to open NEW trades: "1", "2", or "3".
 # Read from env as the default on a fresh deploy, then overridable live via
@@ -332,7 +352,7 @@ strategy_state = {"active": ACTIVE_STRATEGY_DEFAULT}
 STRATEGY_NAMES = {
     "1": "resistance/RSI(77) LONG-only",
     "2": "RSI(14) 80/20 on 1h SHORT+LONG",
-    "3": "resistance touch, no rejection-candle wait, SHORT-only",
+    "3": "resistance, 2-candle close-below confirmation, SHORT-only",
 }
 
 # =============================================================================
@@ -370,7 +390,7 @@ MAX_TRADES_PER_DAY = 25               # hard cap on new entries per calendar day
 ENTRY_COOLDOWN_HOURS = 1
 ENTRY_COOLDOWN_MS = ENTRY_COOLDOWN_HOURS * 60 * 60 * 1000
 
-POLL_INTERVAL_SECONDS = 300           # rescan cadence — matches the 5m chart
+POLL_INTERVAL_SECONDS = 300           # rescan cadence (independent of the 15m candle interval)
 
 # --- Position monitoring ---
 STATUS_UPDATE_INTERVAL_SECONDS = 15 * 60   # send an open-positions P&L snapshot to Telegram this often
@@ -964,7 +984,7 @@ def cancel_order(symbol, order_id, max_retries=2, retry_delay_seconds=2.0):
         return r.json()
 
 def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
-    """Apply rules 1-3: not top-100 cap, down >5% in 24h, >10cr INR volume."""
+    """Apply rules 1-3: not top-200 cap, down >5% in 24h, >10cr INR volume."""
     candidates = []
     min_volume_usdt = MIN_24H_VOLUME_INR / usdt_inr_rate
 
@@ -998,7 +1018,7 @@ def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
 
 
 def screen_candidates_v2(tickers, top_cap_symbols):
-    """Strategy 2's screener. Per instruction: ONLY the top-100-market-cap
+    """Strategy 2's screener. Per instruction: ONLY the top-200-market-cap
     exclusion applies — no 24h-drop-% requirement and deliberately NO
     24h-volume check. Every remaining CoinSwitch futures symbol with a
     readable last_price is a candidate; the actual entry decision is made
@@ -1073,7 +1093,7 @@ def is_volume_declining(candles, lookback=VOLUME_DECLINE_LOOKBACK_CANDLES,
                          min_decline_pct=VOLUME_DECLINE_MIN_PCT):
     """Returns True/False/None:
       True  -> volume has clearly been shrinking over the most recent
-               `lookback` closed 5m candles (buying pressure fading right as
+               `lookback` closed 15m candles (buying pressure fading right as
                price pushes into the resistance level, rather than slamming
                into it on rising volume, which more often precedes a breakout
                rather than a rejection).
@@ -1140,8 +1160,72 @@ def evaluate_resistance(symbol, current_price, candles=None,
     return hit
 
 
+def get_strategy3_confirmed_resistance(symbol, candles):
+    """Strategy 3's own resistance signal: a two-CLOSED-candle confirmation,
+    entirely off candle closes (not the live ticker price the old bare-touch
+    check used).
+
+      Candle N:   its high reaches/crosses a detected resistance level, but
+                  it CLOSES below that level -> arms a pending confirmation
+                  for (symbol, level), returns None (no entry yet).
+      Candle N+1: the very next closed candle also closes below that SAME
+                  level -> returns the level (caller enters SHORT).
+                  If it closes back above the level instead, the pending
+                  confirmation is discarded (candle N was a false start).
+
+    "Very next candle" is enforced by checking that the previously-armed
+    candle is exactly candles[-2] here, i.e. no candle was skipped in
+    between (e.g. because this symbol dropped out of screening for a
+    cycle or two) — a gap discards the stale pending confirmation instead
+    of confirming off a non-adjacent candle.
+
+    Only ever called from enter_trades_strategy3(); reads/writes the
+    module-level strategy3_pending_confirmation dict."""
+    if len(candles) < (2 * PIVOT_WING + 5):
+        return None
+
+    last_candle = candles[-1]
+    last_ts = last_candle.get("start_time")
+    last_close = float(last_candle["c"])
+    last_high = float(last_candle["h"])
+
+    pending = strategy3_pending_confirmation.get(symbol)
+
+    if pending is not None:
+        if pending["candle_ts"] == last_ts:
+            # No new candle has closed since we armed — still waiting.
+            return None
+        prev_ts = candles[-2].get("start_time") if len(candles) >= 2 else None
+        del strategy3_pending_confirmation[symbol]  # consumed either way below
+        if prev_ts == pending["candle_ts"]:
+            level = pending["level"]
+            if last_close < level:
+                print(f"  {symbol}: next 15m candle also closed below resistance "
+                      f"~{level:.6g} — confirmed.")
+                return level
+            print(f"  {symbol}: next 15m candle closed back above resistance "
+                  f"~{level:.6g} — confirmation failed, not entering.")
+        else:
+            print(f"  {symbol}: gap in candle history since arming (symbol likely "
+                  f"dropped out of screening for a cycle) — pending confirmation "
+                  f"discarded rather than confirming off a non-adjacent candle.")
+        # Fall through to check whether this same latest candle itself arms a
+        # brand-new pending confirmation (e.g. it's its own touch-and-close-below).
+
+    levels = find_resistance_levels(candles)
+    for lvl in levels:
+        touched = last_high >= lvl * (1 - RESISTANCE_TOLERANCE_PCT / 100)
+        if touched and last_close < lvl:
+            strategy3_pending_confirmation[symbol] = {"level": lvl, "candle_ts": last_ts}
+            print(f"  {symbol}: 15m candle crossed resistance ~{lvl:.6g} and closed "
+                  f"below it — waiting for the next candle to also close below "
+                  f"before entering short.")
+            break
+    return None
+
+
 def compute_rsi(candles, period=RSI_PERIOD):
-    """Standard Wilder RSI off closed 5m candle closes. Returns the RSI value
+    """Standard Wilder RSI off closed 15m candle closes. Returns the RSI value
     (0-100) as of the most recent CLOSED candle, or None if there aren't
     enough candles yet to compute a `period`-length RSI.
 
@@ -1172,7 +1256,7 @@ def compute_rsi(candles, period=RSI_PERIOD):
 
 def is_rsi_overbought_short_trigger(candles, threshold=RSI_OVERBOUGHT_SHORT_THRESHOLD, period=RSI_PERIOD):
     """Rule 4b (independent of resistance/rejection/volume-decline — rule 4):
-    on the 5-minute chart, RSI(period) above `threshold` triggers a short on
+    on the 15-minute chart, RSI(period) above `threshold` triggers a short on
     its own. Returns (triggered: bool, rsi_value: float|None). rsi_value is
     still returned when not triggered (or None) so callers can log/inspect
     it either way."""
@@ -1184,7 +1268,7 @@ def is_rsi_overbought_short_trigger(candles, threshold=RSI_OVERBOUGHT_SHORT_THRE
 
 def send_volume_debug(symbol):
     """Handles the /debugvolume SYMBOL command — fetches this symbol's most
-    recent 5m candles and shows exactly what raw fields CoinSwitch returned
+    recent 15m candles and shows exactly what raw fields CoinSwitch returned
     for each one, alongside what get_candle_volume()/is_volume_declining()
     actually parsed out of them. Use this to confirm the real key CoinSwitch
     uses for kline volume instead of guessing from Railway logs — see
@@ -1321,6 +1405,7 @@ def save_state(open_shorts, daily_trade_tracker):
             "open_shorts": open_shorts,
             "daily_trade_tracker": daily_trade_tracker,
             "active_strategy": strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT),
+            "strategy3_pending_confirmation": strategy3_pending_confirmation,
             "saved_at_ms": int(time.time() * 1000),
         }
         tmp_path = STATE_FILE_PATH + ".tmp"
@@ -1345,6 +1430,12 @@ def load_state():
         if saved_strategy in ("1", "2", "3"):
             strategy_state["active"] = saved_strategy
             print(f"  [state] restored active strategy from saved state: strategy {saved_strategy}")
+        saved_pending = payload.get("strategy3_pending_confirmation")
+        if saved_pending:
+            strategy3_pending_confirmation.clear()
+            strategy3_pending_confirmation.update(saved_pending)
+            print(f"  [state] restored {len(saved_pending)} in-progress strategy 3 "
+                  f"resistance confirmation(s) from saved state.")
         return payload.get("open_shorts") or {}, payload.get("daily_trade_tracker")
     except FileNotFoundError:
         return None, None
@@ -2803,12 +2894,12 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         resistance = evaluate_resistance(symbol, cand["last_price"], candles=candles)
 
         # Two INDEPENDENT ways to arrive at a SHORT signal for a symbol that
-        # already passed base screening (rules 1-3: not top-100, down >5% in
+        # already passed base screening (rules 1-3: not top-200, down >5% in
         # 24h, >10cr INR volume):
-        #   (a) resistance path (rule 4) — confirmed sitting at a real 5m
+        #   (a) resistance path (rule 4) — confirmed sitting at a real 15m
         #       resistance level, plus rejection candle / declining-volume
         #       checks per REQUIRE_REJECTION_CANDLE / REQUIRE_DECLINING_VOLUME.
-        #   (b) RSI path (rule 4b) — 5m-candle RSI above
+        #   (b) RSI path (rule 4b) — 15m-candle RSI above
         #       RSI_OVERBOUGHT_SHORT_THRESHOLD, checked on its own and
         #       WITHOUT the resistance/rejection/volume-decline check. This
         #       does not stack with (a): either one on its own is enough.
@@ -2865,7 +2956,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
 
         # Size everything downstream off what actually filled, not what we asked
         # for. Futures MARKET orders can PARTIALLY_EXECUTE with no auto-retry of
-        # the remainder — and this strategy specifically targets non-top-100,
+        # the remainder — and this strategy specifically targets non-top-200,
         # lower-liquidity coins, so partial fills are a real possibility, not an
         # edge case. Using the requested qty here for the reduce-only TP order
         # (or for P&L bookkeeping) would size it against a position that doesn't
@@ -2947,7 +3038,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
 
 def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available_balance_usdt,
                             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
-    """Strategy 2's entry loop. `candidates` is already narrowed to non-top-100
+    """Strategy 2's entry loop. `candidates` is already narrowed to non-top-200
     symbols only (see screen_candidates_v2()) — deliberately no 24h-drop-% or
     volume filter for this strategy. Signal is pure 1h-candle RSI, checked in
     both directions:
@@ -3102,12 +3193,16 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
 def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available_balance_usdt,
                             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
     """Strategy 3's entry loop. `candidates` uses the exact same screening as
-    strategy 1 (screen_candidates(): not top-100, down >5% in 24h, >10cr INR
-    volume). Signal is resistance-only (no RSI path) on the 5m chart, same
-    level detection as strategy 1 (find_resistance_levels() / is_at_resistance()
-    via evaluate_resistance()), but:
-        - does NOT require a confirmed rejection candle — shorts as soon as
-          price is within RESISTANCE_TOLERANCE_PCT of a detected level
+    strategy 1 (screen_candidates(): not top-200, down >5% in 24h, >10cr INR
+    volume). Signal is resistance-only (no RSI path) on the 15m chart, same
+    level detection as strategy 1 (find_resistance_levels()), but:
+        - does NOT require has_rejection_candle()'s strict wick>=body test —
+          instead requires TWO CONSECUTIVE closed 15m candles to close below
+          a touched resistance level (see get_strategy3_confirmed_resistance()):
+          candle N touches the level but closes below it (arms a pending
+          confirmation, no entry yet), and only if the very next candle N+1
+          ALSO closes below that level does this function enter. This is
+          entirely off closed-candle data, not the live ticker price.
         - DOES actually place a SHORT (SELL), unlike strategy 1's LONG bug
     Volume-decline filtering still applies per STRATEGY3_REQUIRE_DECLINING_VOLUME.
     Leverage resolution, the daily trade cap, the re-entry cooldown, and
@@ -3136,23 +3231,25 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
         time.sleep(2.1)  # same KLines rate-limit pacing as strategies 1 and 2
 
         try:
-            candles = get_klines(symbol)  # 5m chart, same interval as strategy 1
+            candles = get_klines(symbol)  # 15m chart, same interval as strategy 1
         except requests.HTTPError as e:
             print(f"  {symbol}: klines fetch failed ({e}), skipping.")
             continue
 
-        resistance = evaluate_resistance(
-            symbol, cand["last_price"], candles=candles,
-            require_rejection_candle=False,
-            require_declining_volume=STRATEGY3_REQUIRE_DECLINING_VOLUME,
-        )
+        resistance = get_strategy3_confirmed_resistance(symbol, candles)
         if resistance is None:
+            continue
+        if STRATEGY3_REQUIRE_DECLINING_VOLUME and is_volume_declining(candles) is False:
+            # Only a confirmed False (volume readable and NOT declining) blocks
+            # the trade — None (unreadable/insufficient data) falls through,
+            # same "don't let a missing field silently kill every signal"
+            # behavior evaluate_resistance() used.
             continue
 
         print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
               f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
               f"price {cand['last_price']}, resistance ~{resistance:.6g} "
-              f"(touch, no rejection-candle confirmation) — [Strategy 3] SHORT signal")
+              f"(2-candle close-below confirmation) — [Strategy 3] SHORT signal")
 
         instrument = instruments.get(symbol)
         if instrument is None:
@@ -3199,7 +3296,7 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
             f"24h: {cand['pct_change_24h']:.2f}%  |  Signal: resistance ~{resistance:.6g} "
-            f"(touch only, no rejection-candle confirmation)\n"
+            f"(2 consecutive 15m candles closed below level)\n"
             f"No stop-loss set on this position. Use /sl {symbol} PRICE to set one, /tp {symbol} PRICE to change the take-profit."
         )
         send_telegram_message(entry_msg)
@@ -3279,12 +3376,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     today = today_ist()
 
-    # Refresh the top-100 market-cap exclusion list and the USDT/INR
+    # Refresh the top-200 market-cap exclusion list and the USDT/INR
     # conversion rate once per IST calendar day. These were previously only
     # ever fetched once at process startup and then reused for the entire
     # lifetime of the container — on Railway that can mean running for days
     # against a market-cap ranking and FX rate that are stale by then. A coin
-    # that's fallen out of (or risen into) the top 100 since startup would be
+    # that's fallen out of (or risen into) the top 200 since startup would be
     # screened against the wrong exclusion list, and the margin-per-trade
     # sizing (CAPITAL_INR / usdt_inr_rate) would silently drift from its
     # intended INR value as the real USDT/INR rate moves.
@@ -3293,7 +3390,7 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
             usdt_inr_rate = get_usdt_inr_rate()
             last_market_refresh_date = today
-            print(f"  [refresh] top-100 market cap list and USDT/INR rate refreshed for {today} "
+            print(f"  [refresh] top-200 market cap list and USDT/INR rate refreshed for {today} "
                   f"(USDT/INR ~= {usdt_inr_rate}).")
         except requests.HTTPError as e:
             # Don't let a transient CoinGecko blip abort this cycle's scan —
@@ -3401,9 +3498,9 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
 
 def main():
-    print("Fetching top-100 market cap list and USDT/INR rate from CoinGecko...")
+    print("Fetching top-200 market cap list and USDT/INR rate from CoinGecko...")
     top_cap_symbols = fetch_with_retry(
-        get_top_market_cap_symbols, TOP_N_MARKET_CAP_EXCLUDE, description="top-100 market cap list"
+        get_top_market_cap_symbols, TOP_N_MARKET_CAP_EXCLUDE, description="top-200 market cap list"
     )
     usdt_inr_rate = fetch_with_retry(get_usdt_inr_rate, description="USDT/INR rate")
     # Seeded to today (IST) since we just fetched fresh values above — this
