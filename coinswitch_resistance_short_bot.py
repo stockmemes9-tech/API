@@ -6,7 +6,7 @@ Strategy (as described by the user):
   Short a coin when ALL of the following are true:
     1. It is NOT in the top-200 cryptos by global market cap.
     2. It is down more than 5% in the last 24 hours.
-    3. It has more than 10 crore (10,00,00,000) INR of trading volume in the last 24 hours.
+    3. Its 24h trading volume is between 2 crore (2,00,00,000) and 40 crore (40,00,00,000) INR.
     4. EITHER of the following two independent signals (only one is needed,
        they don't stack):
          4a. On the 15-minute chart, price is currently sitting at a
@@ -225,7 +225,11 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0"
 # --- Screener thresholds ---
 TOP_N_MARKET_CAP_EXCLUDE = 200
 MIN_24H_DROP_PCT = 5.0                # price must be down at least this much
-MIN_24H_VOLUME_INR = 10_00_00_000     # 10 crore INR
+MIN_24H_VOLUME_INR = 2_00_00_000      # 2 crore INR
+MAX_24H_VOLUME_INR = 40_00_00_000     # 40 crore INR — coins above this are excluded too (the idea being
+                                       # very high-volume/liquid coins on this non-top-200 screen behave
+                                       # differently from the thinner, choppier names this bot is meant
+                                       # to trade — see screen_candidates()).
 
 # --- Resistance detection (15m chart) ---
 KLINE_INTERVAL = "15"                 # minutes; "15" = 15m candles
@@ -250,7 +254,7 @@ VOLUME_DECLINE_MIN_PCT = 15.0         # 2nd half of that window must average at 
 # --- RSI overbought short trigger (15m chart) ---
 # A SECOND, independent entry path alongside the resistance setup above. A
 # candidate that already passed rule 1-3 screening (not top-200, down >5% in
-# 24h, >10cr INR volume) is also shorted if its 15m-candle RSI is above the
+# 24h, 2cr-40cr INR volume) is also shorted if its 15m-candle RSI is above the
 # threshold below — even if it never shows a confirmed resistance rejection.
 # Per your instruction: base screening still applies, but the
 # resistance/rejection-candle/declining-volume check is skipped entirely for
@@ -294,7 +298,7 @@ STRATEGY2_LOOKBACK_CANDLES = 100      # ~4 days of 1h candles — plenty for a 1
 
 # ============================ STRATEGY 3 (resistance, no confirmation) ======
 # A third, separate strategy. Same base screening (rules 1-3, identical to
-# strategy 1: not top-200, down >5% in 24h, >10cr INR volume) and the same
+# strategy 1: not top-200, down >5% in 24h, 2cr-40cr INR volume) and the same
 # resistance-level detection (find_resistance_levels() / is_at_resistance()),
 # but two differences from strategy 1's path 4a:
 #   - Does NOT require a confirmed rejection candle (has_rejection_candle())
@@ -389,6 +393,18 @@ MAX_TRADES_PER_DAY = 25               # hard cap on new entries per calendar day
 # See daily_trade_tracker["recent_entries"] (symbol -> opened_at_ms) below.
 ENTRY_COOLDOWN_HOURS = 1
 ENTRY_COOLDOWN_MS = ENTRY_COOLDOWN_HOURS * 60 * 60 * 1000
+
+# Separate, longer cooldown that only kicks in when the symbol's most recent
+# closed trade (any strategy, any close reason — stop-loss, take-profit,
+# manual Telegram close, or exchange-detected close) was a LOSS. A winning
+# close still only blocks re-entry for ENTRY_COOLDOWN_HOURS above; a losing
+# close blocks re-entry for this much longer, on the theory that a setup
+# that just failed on this symbol is more likely to fail again soon than to
+# suddenly start working. Rolling window per symbol, same style as
+# ENTRY_COOLDOWN_MS/recent_entries — survives the midnight-IST rollover.
+# See daily_trade_tracker["recent_losses"] (symbol -> closed_at_ms) below.
+LOSS_COOLDOWN_HOURS = 48
+LOSS_COOLDOWN_MS = LOSS_COOLDOWN_HOURS * 60 * 60 * 1000
 
 POLL_INTERVAL_SECONDS = 300           # rescan cadence (independent of the 15m candle interval)
 
@@ -984,9 +1000,10 @@ def cancel_order(symbol, order_id, max_retries=2, retry_delay_seconds=2.0):
         return r.json()
 
 def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
-    """Apply rules 1-3: not top-200 cap, down >5% in 24h, >10cr INR volume."""
+    """Apply rules 1-3: not top-200 cap, down >5% in 24h, 2cr-40cr INR volume."""
     candidates = []
     min_volume_usdt = MIN_24H_VOLUME_INR / usdt_inr_rate
+    max_volume_usdt = MAX_24H_VOLUME_INR / usdt_inr_rate
 
     for symbol, t in tickers.items():
         base_symbol = symbol.replace("USDT", "").upper()
@@ -1006,7 +1023,8 @@ def screen_candidates(tickers, top_cap_symbols, usdt_inr_rate):
         except (KeyError, ValueError):
             continue
 
-        if pct_change <= -MIN_24H_DROP_PCT and quote_volume >= min_volume_usdt:
+        if (pct_change <= -MIN_24H_DROP_PCT
+                and min_volume_usdt <= quote_volume <= max_volume_usdt):
             candidates.append({
                 "symbol": symbol,
                 "last_price": float(t["last_price"]),
@@ -1214,7 +1232,16 @@ def get_strategy3_confirmed_resistance(symbol, candles):
 
     levels = find_resistance_levels(candles)
     for lvl in levels:
-        touched = last_high >= lvl * (1 - RESISTANCE_TOLERANCE_PCT / 100)
+        # BUGFIX: this used to only check `last_high >= lvl * (1 - tol/100)`,
+        # i.e. only a LOWER bound on how close the high got to the level.
+        # That's trivially true for almost any level sitting below the
+        # current price — a coin trading at $100 would "touch" an old $50
+        # pivot high just because 100 >= 50 * 0.996, even though price isn't
+        # anywhere near that level. Needs an UPPER bound too, so this only
+        # fires when the high actually landed close to (at, or barely
+        # through) the level, mirroring what is_at_resistance() already
+        # enforces for strategy 1.
+        touched = lvl * (1 - RESISTANCE_TOLERANCE_PCT / 100) <= last_high <= lvl * (1 + RESISTANCE_TOLERANCE_PCT / 100)
         if touched and last_close < lvl:
             strategy3_pending_confirmation[symbol] = {"level": lvl, "candle_ts": last_ts}
             print(f"  {symbol}: 15m candle crossed resistance ~{lvl:.6g} and closed "
@@ -1482,10 +1509,12 @@ def recover_open_positions(instruments, daily_trade_tracker):
         # from re-entry this morning if within the cooldown window, not get
         # reset just because the date ticked over).
         daily_trade_tracker["recent_entries"] = state_daily_tracker.get("recent_entries") or {}
+        daily_trade_tracker["recent_losses"] = state_daily_tracker.get("recent_losses") or {}
         print(f"  [state] saved state is from a previous day "
               f"({state_daily_tracker.get('date')}), not restoring today's counters "
-              f"(re-entry cooldown timestamps were still restored).")
+              f"(re-entry and loss cooldown timestamps were still restored).")
     daily_trade_tracker.setdefault("recent_entries", {})
+    daily_trade_tracker.setdefault("recent_losses", {})
 
     # Simulated (DRY_RUN) shorts never touched the real exchange, so there's
     # nothing to verify them against — the saved state IS the only record of
@@ -1677,6 +1706,18 @@ def recover_open_positions(instruments, daily_trade_tracker):
 # tracked short has actually closed, and if so, drop it from open_shorts and
 # fold its P&L into the daily tracker.
 
+def record_loss_cooldown(symbol, pnl, daily_trade_tracker, closed_at_ms):
+    """Stamps symbol -> closed_at_ms in daily_trade_tracker["recent_losses"]
+    whenever a trade closes at a loss, so the entry functions can enforce
+    LOSS_COOLDOWN_MS before allowing a re-entry on that symbol. A later win
+    on the same symbol does NOT clear this — the cooldown is purely time-based,
+    same as recent_entries, so it always expires after LOSS_COOLDOWN_HOURS
+    rather than being reset by whatever closes next. Call this from every
+    close path (reconcile, manual close) alongside record_trade_close()."""
+    if pnl < 0:
+        daily_trade_tracker.setdefault("recent_losses", {})[symbol] = closed_at_ms
+
+
 def record_trade_close(symbol, pos, pnl, reason):
     """Appends one row to the trade-history CSV for every position that
     closes, however it closed (take-profit, manual Telegram button, or
@@ -1806,6 +1847,7 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
             daily_trade_tracker["wins"] += 1
         else:
             daily_trade_tracker["losses"] += 1
+        record_loss_cooldown(symbol, pnl, daily_trade_tracker, int(time.time() * 1000))
         record_trade_close(symbol, pos, pnl, reason)
         print(f"  [reconcile] {symbol}: position closed. P&L {pnl:+.2f} USDT.")
         send_telegram_message(
@@ -2163,6 +2205,7 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
         daily_trade_tracker["wins"] += 1
     else:
         daily_trade_tracker["losses"] += 1
+    record_loss_cooldown(symbol, pnl, daily_trade_tracker, int(time.time() * 1000))
     record_trade_close(symbol, pos, pnl, "manual_telegram")
     save_state(open_shorts, daily_trade_tracker)
 
@@ -2332,7 +2375,8 @@ def send_help_message():
         "/history — closed-trade summary (win/loss, all-time P&L) + CSV file",
         "/analytics — win rate, avg win/loss, win/loss streak stats",
         "/fees — brokerage (commission), funding fees, and net P&L after fees (today + all-time)",
-        f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule",
+        f"/cooldowns — symbols currently blocked by the {ENTRY_COOLDOWN_HOURS}h re-entry rule "
+        f"or the {LOSS_COOLDOWN_HOURS}h loss cooldown",
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/tp SYMBOL PRICE — change the take-profit for an open position (0 removes it)",
         "/sl SYMBOL PRICE — set/change the stop-loss for an open position (0 removes it)",
@@ -2363,26 +2407,44 @@ def send_on_demand_status(open_shorts, daily_trade_tracker):
 
 def send_cooldowns_status(daily_trade_tracker):
     """Handles the /cooldowns command — lists every symbol currently blocked
-    by the re-entry rule (see ENTRY_COOLDOWN_HOURS and
-    daily_trade_tracker["recent_entries"]) and how many hours remain until
-    each is eligible for a new entry again. Caller MUST already hold
-    state_lock, same as /status, since recent_entries is part of the shared
-    daily_trade_tracker dict the scan loop also mutates."""
+    from re-entry, whether by the plain ENTRY_COOLDOWN_HOURS re-entry rule
+    (daily_trade_tracker["recent_entries"]) or by the longer
+    LOSS_COOLDOWN_HOURS rule that kicks in after a losing close
+    (daily_trade_tracker["recent_losses"]) — and how many hours remain until
+    each is eligible again. Caller MUST already hold state_lock, same as
+    /status, since both dicts are part of the shared daily_trade_tracker the
+    scan loop also mutates."""
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - ENTRY_COOLDOWN_MS
     active = {
         s: t for s, t in daily_trade_tracker.get("recent_entries", {}).items()
         if t >= cutoff_ms
     }
-    if not active:
-        send_telegram_message(f"No symbols currently on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown.")
+    loss_cutoff_ms = now_ms - LOSS_COOLDOWN_MS
+    active_losses = {
+        s: t for s, t in daily_trade_tracker.get("recent_losses", {}).items()
+        if t >= loss_cutoff_ms
+    }
+    if not active and not active_losses:
+        send_telegram_message(
+            f"No symbols currently on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown or the "
+            f"{LOSS_COOLDOWN_HOURS}h loss cooldown."
+        )
         return
 
-    lines = [f"⏳ {len(active)} symbol(s) on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown:"]
-    for symbol, opened_at_ms in sorted(active.items(), key=lambda kv: kv[1]):
-        hours_left = (opened_at_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
-        entered_ist = datetime.datetime.fromtimestamp(opened_at_ms / 1000, IST).strftime("%Y-%m-%d %H:%M:%S")
-        lines.append(f"  {symbol}: entered {entered_ist} IST — eligible again in ~{hours_left:.1f}h")
+    lines = []
+    if active:
+        lines.append(f"⏳ {len(active)} symbol(s) on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown:")
+        for symbol, opened_at_ms in sorted(active.items(), key=lambda kv: kv[1]):
+            hours_left = (opened_at_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            entered_ist = datetime.datetime.fromtimestamp(opened_at_ms / 1000, IST).strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"  {symbol}: entered {entered_ist} IST — eligible again in ~{hours_left:.1f}h")
+    if active_losses:
+        lines.append(f"🔴 {len(active_losses)} symbol(s) on the {LOSS_COOLDOWN_HOURS}h loss cooldown:")
+        for symbol, closed_at_ms in sorted(active_losses.items(), key=lambda kv: kv[1]):
+            hours_left = (closed_at_ms + LOSS_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            closed_ist = datetime.datetime.fromtimestamp(closed_at_ms / 1000, IST).strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"  {symbol}: lost on close at {closed_ist} IST — eligible again in ~{hours_left:.1f}h")
     send_telegram_message("\n".join(lines))
 
 
@@ -2847,7 +2909,8 @@ def heartbeat_loop(open_shorts):
 # ------------------------------ Main loop ---------------------------------------
 
 def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available_balance_usdt,
-                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+                            loss_cooldown_cutoff_ms=None):
     """Strategy 1's entry loop — resistance/RSI(77) LONG-only signal (same
     resistance/RSI trigger logic run_once() used to run inline before strategy 2
     existed, but now opens a LONG on trigger instead of a SHORT). Only called
@@ -2863,6 +2926,14 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
             hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
             print(f"  {symbol}: passed screening but was entered within the last "
                   f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
+            continue
+        last_loss_ms = daily_trade_tracker.get("recent_losses", {}).get(symbol)
+        if (loss_cooldown_cutoff_ms is not None and last_loss_ms is not None
+                and last_loss_ms >= loss_cooldown_cutoff_ms):
+            hours_left = (last_loss_ms + LOSS_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but its last close was a LOSS within the "
+                  f"last {LOSS_COOLDOWN_HOURS}h — skipping re-entry for another "
                   f"~{hours_left:.1f}h.")
             continue
         if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
@@ -2895,7 +2966,7 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
 
         # Two INDEPENDENT ways to arrive at a SHORT signal for a symbol that
         # already passed base screening (rules 1-3: not top-200, down >5% in
-        # 24h, >10cr INR volume):
+        # 24h, 2cr-40cr INR volume):
         #   (a) resistance path (rule 4) — confirmed sitting at a real 15m
         #       resistance level, plus rejection candle / declining-volume
         #       checks per REQUIRE_REJECTION_CANDLE / REQUIRE_DECLINING_VOLUME.
@@ -3037,7 +3108,8 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
 
 
 def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available_balance_usdt,
-                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+                            loss_cooldown_cutoff_ms=None):
     """Strategy 2's entry loop. `candidates` is already narrowed to non-top-200
     symbols only (see screen_candidates_v2()) — deliberately no 24h-drop-% or
     volume filter for this strategy. Signal is pure 1h-candle RSI, checked in
@@ -3058,6 +3130,14 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
             hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
             print(f"  {symbol}: passed screening but was entered within the last "
                   f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
+            continue
+        last_loss_ms = daily_trade_tracker.get("recent_losses", {}).get(symbol)
+        if (loss_cooldown_cutoff_ms is not None and last_loss_ms is not None
+                and last_loss_ms >= loss_cooldown_cutoff_ms):
+            hours_left = (last_loss_ms + LOSS_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but its last close was a LOSS within the "
+                  f"last {LOSS_COOLDOWN_HOURS}h — skipping re-entry for another "
                   f"~{hours_left:.1f}h.")
             continue
         if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
@@ -3191,9 +3271,10 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
 
 
 def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available_balance_usdt,
-                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms):
+                            daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+                            loss_cooldown_cutoff_ms=None):
     """Strategy 3's entry loop. `candidates` uses the exact same screening as
-    strategy 1 (screen_candidates(): not top-200, down >5% in 24h, >10cr INR
+    strategy 1 (screen_candidates(): not top-200, down >5% in 24h, 2cr-40cr INR
     volume). Signal is resistance-only (no RSI path) on the 15m chart, same
     level detection as strategy 1 (find_resistance_levels()), but:
         - does NOT require has_rejection_candle()'s strict wick>=body test —
@@ -3217,6 +3298,14 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
             hours_left = (last_entry_ms + ENTRY_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
             print(f"  {symbol}: passed screening but was entered within the last "
                   f"{ENTRY_COOLDOWN_HOURS}h — skipping re-entry for another "
+                  f"~{hours_left:.1f}h.")
+            continue
+        last_loss_ms = daily_trade_tracker.get("recent_losses", {}).get(symbol)
+        if (loss_cooldown_cutoff_ms is not None and last_loss_ms is not None
+                and last_loss_ms >= loss_cooldown_cutoff_ms):
+            hours_left = (last_loss_ms + LOSS_COOLDOWN_MS - now_ms) / (60 * 60 * 1000)
+            print(f"  {symbol}: passed screening but its last close was a LOSS within the "
+                  f"last {LOSS_COOLDOWN_HOURS}h — skipping re-entry for another "
                   f"~{hours_left:.1f}h.")
             continue
         if not DRY_RUN and daily_trade_tracker["count"] >= MAX_TRADES_PER_DAY:
@@ -3471,6 +3560,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     daily_trade_tracker["recent_entries"] = {
         s: t for s, t in daily_trade_tracker["recent_entries"].items() if t >= cooldown_cutoff_ms
     }
+    loss_cooldown_cutoff_ms = now_ms - LOSS_COOLDOWN_MS
+    daily_trade_tracker["recent_losses"] = {
+        s: t for s, t in daily_trade_tracker.get("recent_losses", {}).items() if t >= loss_cooldown_cutoff_ms
+    }
 
     # Dispatch to whichever strategy is currently active. Positions already
     # open from the OTHER strategy are unaffected either way — they keep
@@ -3480,16 +3573,19 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         available_balance_usdt = enter_trades_strategy1(
             candidates, instruments, order_margin_usdt, available_balance_usdt,
             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+            loss_cooldown_cutoff_ms=loss_cooldown_cutoff_ms,
         )
     elif active_strategy == "3":
         available_balance_usdt = enter_trades_strategy3(
             candidates, instruments, order_margin_usdt, available_balance_usdt,
             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+            loss_cooldown_cutoff_ms=loss_cooldown_cutoff_ms,
         )
     else:
         available_balance_usdt = enter_trades_strategy2(
             candidates, instruments, order_margin_usdt, available_balance_usdt,
             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
+            loss_cooldown_cutoff_ms=loss_cooldown_cutoff_ms,
         )
     # Returned so main()'s loop can carry the (possibly refreshed) market
     # data and refresh-date marker into the next cycle — run_once() itself
@@ -3522,6 +3618,9 @@ def main():
         "recent_entries": {},     # symbol -> opened_at_ms of its most recent entry (real or DRY_RUN),
                                    # used for the no-re-entry cooldown (ENTRY_COOLDOWN_HOURS). Rolling window, NOT reset
                                    # on the midnight-IST rollover below (see recover_open_positions()).
+        "recent_losses": {},      # symbol -> closed_at_ms of its most recent LOSING close, used for the
+                                   # longer no-re-entry cooldown (LOSS_COOLDOWN_HOURS). Same rolling-window
+                                   # behavior as recent_entries — survives the midnight-IST rollover.
     }  # resets at midnight IST; a summary is sent to Telegram right before the reset.
        # May be overwritten below by recover_open_positions() if a same-day
        # saved state file exists (restores counters across a restart).
