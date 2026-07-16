@@ -317,16 +317,16 @@ STRATEGY3_ENABLED = True
 STRATEGY3_REQUIRE_DECLINING_VOLUME = True   # set False to also skip the volume-decline filter
 STRATEGY3_TP_CAPITAL_PCT = 5.0        # target: 5% profit on capital employed, same style as TP_CAPITAL_PCT
 
-# Two-candle confirmation (replaces the old bare-touch entry):
-#   Candle N:   crosses/touches a resistance level (its high reaches the
-#               level) but CLOSES below it -> arms a pending confirmation
-#               for that symbol/level, does NOT enter yet.
-#   Candle N+1: the very next closed 15m candle for that symbol also closes
-#               below the SAME level -> confirmed, enter SHORT this cycle.
-# If candle N+1 closes back above the level (or a gap in candle history
-# means it isn't really the immediate next candle), the pending confirmation
-# is discarded rather than entering. See get_strategy3_confirmed_resistance()
-# and strategy3_pending_confirmation below.
+# Break-and-reject confirmation (replaces the old bare-touch entry):
+#   Candle N:   CLOSES ABOVE a resistance level -> arms a pending
+#               confirmation for that symbol/level, does NOT enter yet.
+#   Candle N+1: the very next closed 15m candle for that symbol CLOSES
+#               BELOW the SAME level -> confirmed, enter SHORT this cycle.
+# If candle N+1 does not close back below the level (or a gap in candle
+# history means it isn't really the immediate next candle), the pending
+# confirmation is discarded rather than entering. See
+# get_strategy3_confirmed_resistance() and strategy3_pending_confirmation
+# below.
 STRATEGY3_REQUIRE_TWO_CANDLE_CONFIRMATION = True
 
 # symbol -> {"level": float, "candle_ts": <last confirmed candle's start_time>}
@@ -356,7 +356,7 @@ strategy_state = {"active": ACTIVE_STRATEGY_DEFAULT}
 STRATEGY_NAMES = {
     "1": "resistance/RSI(77) LONG-only",
     "2": "RSI(14) 80/20 on 1h SHORT+LONG",
-    "3": "resistance, 2-candle close-below confirmation, SHORT-only",
+    "3": "resistance, close-above-then-close-below confirmation, SHORT-only",
 }
 
 # =============================================================================
@@ -1179,17 +1179,20 @@ def evaluate_resistance(symbol, current_price, candles=None,
 
 
 def get_strategy3_confirmed_resistance(symbol, candles):
-    """Strategy 3's own resistance signal: a two-CLOSED-candle confirmation,
+    """Strategy 3's own resistance signal: a break-and-reject confirmation,
     entirely off candle closes (not the live ticker price the old bare-touch
     check used).
 
-      Candle N:   its high reaches/crosses a detected resistance level, but
-                  it CLOSES below that level -> arms a pending confirmation
-                  for (symbol, level), returns None (no entry yet).
-      Candle N+1: the very next closed candle also closes below that SAME
-                  level -> returns the level (caller enters SHORT).
-                  If it closes back above the level instead, the pending
-                  confirmation is discarded (candle N was a false start).
+      Candle N:   CLOSES ABOVE a detected resistance level -> arms a pending
+                  confirmation for (symbol, level), returns None (no entry
+                  yet).
+      Candle N+1: the very next closed candle CLOSES BELOW that SAME level
+                  -> returns the level (caller enters SHORT).
+                  If it closes at/above the level instead, the pending
+                  confirmation is discarded (candle N's breakout held, so no
+                  short signal) — but that same candle N+1 can still arm its
+                  own new pending confirmation if it itself qualifies (see
+                  fallthrough below).
 
     "Very next candle" is enforced by checking that the previously-armed
     candle is exactly candles[-2] here, i.e. no candle was skipped in
@@ -1205,7 +1208,6 @@ def get_strategy3_confirmed_resistance(symbol, candles):
     last_candle = candles[-1]
     last_ts = last_candle.get("start_time")
     last_close = float(last_candle["c"])
-    last_high = float(last_candle["h"])
 
     pending = strategy3_pending_confirmation.get(symbol)
 
@@ -1218,35 +1220,33 @@ def get_strategy3_confirmed_resistance(symbol, candles):
         if prev_ts == pending["candle_ts"]:
             level = pending["level"]
             if last_close < level:
-                print(f"  {symbol}: next 15m candle also closed below resistance "
-                      f"~{level:.6g} — confirmed.")
+                print(f"  {symbol}: closed above resistance ~{level:.6g}, then the "
+                      f"very next 15m candle closed back below it — confirmed.")
                 return level
-            print(f"  {symbol}: next 15m candle closed back above resistance "
-                  f"~{level:.6g} — confirmation failed, not entering.")
+            print(f"  {symbol}: closed above resistance ~{level:.6g} but the next "
+                  f"15m candle did NOT close back below it — confirmation failed, "
+                  f"not entering.")
         else:
             print(f"  {symbol}: gap in candle history since arming (symbol likely "
                   f"dropped out of screening for a cycle) — pending confirmation "
                   f"discarded rather than confirming off a non-adjacent candle.")
         # Fall through to check whether this same latest candle itself arms a
-        # brand-new pending confirmation (e.g. it's its own touch-and-close-below).
+        # brand-new pending confirmation (e.g. it's its own close-above).
 
     levels = find_resistance_levels(candles)
     for lvl in levels:
-        # BUGFIX: this used to only check `last_high >= lvl * (1 - tol/100)`,
-        # i.e. only a LOWER bound on how close the high got to the level.
-        # That's trivially true for almost any level sitting below the
-        # current price — a coin trading at $100 would "touch" an old $50
-        # pivot high just because 100 >= 50 * 0.996, even though price isn't
-        # anywhere near that level. Needs an UPPER bound too, so this only
-        # fires when the high actually landed close to (at, or barely
-        # through) the level, mirroring what is_at_resistance() already
-        # enforces for strategy 1.
-        touched = lvl * (1 - RESISTANCE_TOLERANCE_PCT / 100) <= last_high <= lvl * (1 + RESISTANCE_TOLERANCE_PCT / 100)
-        if touched and last_close < lvl:
+        # Candle must CLOSE above the level to count as a breakout. Upper-
+        # bounded by the tolerance band so a level the price broke through
+        # long ago (and is now far above) doesn't keep re-arming on every
+        # scan — this only fires on a close that's freshly just above the
+        # level, mirroring the tolerance is_at_resistance() uses for
+        # strategy 1.
+        broke_above = lvl < last_close <= lvl * (1 + RESISTANCE_TOLERANCE_PCT / 100)
+        if broke_above:
             strategy3_pending_confirmation[symbol] = {"level": lvl, "candle_ts": last_ts}
-            print(f"  {symbol}: 15m candle crossed resistance ~{lvl:.6g} and closed "
-                  f"below it — waiting for the next candle to also close below "
-                  f"before entering short.")
+            print(f"  {symbol}: 15m candle closed above resistance ~{lvl:.6g} — "
+                  f"waiting for the next candle to close back below it before "
+                  f"entering short.")
             break
     return None
 
@@ -2383,7 +2383,7 @@ def send_help_message():
         "/strategy — show which strategy is currently active for new trades",
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
-        "/strategy3 — switch to Strategy 3 (resistance touch, no rejection-candle wait, SHORT-only)",
+        "/strategy3 — switch to Strategy 3 (close above resistance, then next candle closes below it, SHORT-only)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
@@ -2775,7 +2775,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         f"Active strategy: {current}\n"
                         f"1 = resistance/RSI(77) LONG-only\n"
                         f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
-                        f"3 = resistance touch, no rejection-candle wait, SHORT-only\n"
+                        f"3 = resistance close-above then close-below confirmation, SHORT-only\n"
                         f"Switch with /strategy1, /strategy2, or /strategy3."
                     )
                 elif text in ("/help", "/commands"):
@@ -3278,12 +3278,12 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
     volume). Signal is resistance-only (no RSI path) on the 15m chart, same
     level detection as strategy 1 (find_resistance_levels()), but:
         - does NOT require has_rejection_candle()'s strict wick>=body test —
-          instead requires TWO CONSECUTIVE closed 15m candles to close below
-          a touched resistance level (see get_strategy3_confirmed_resistance()):
-          candle N touches the level but closes below it (arms a pending
-          confirmation, no entry yet), and only if the very next candle N+1
-          ALSO closes below that level does this function enter. This is
-          entirely off closed-candle data, not the live ticker price.
+          instead requires a break-and-reject: closed candle N closes ABOVE
+          a resistance level (arms a pending confirmation, no entry yet),
+          and only if the very next closed candle N+1 closes BELOW that same
+          level does this function enter (see
+          get_strategy3_confirmed_resistance()). This is entirely off
+          closed-candle data, not the live ticker price.
         - DOES actually place a SHORT (SELL), unlike strategy 1's LONG bug
     Volume-decline filtering still applies per STRATEGY3_REQUIRE_DECLINING_VOLUME.
     Leverage resolution, the daily trade cap, the re-entry cooldown, and
@@ -3338,7 +3338,7 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
         print(f"  >>> {symbol}: {cand['pct_change_24h']:.2f}% 24h, "
               f"vol {cand['quote_volume_24h_usdt']:.0f} USDT, "
               f"price {cand['last_price']}, resistance ~{resistance:.6g} "
-              f"(2-candle close-below confirmation) — [Strategy 3] SHORT signal")
+              f"(close-above then close-below confirmation) — [Strategy 3] SHORT signal")
 
         instrument = instruments.get(symbol)
         if instrument is None:
@@ -3385,7 +3385,7 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
             f"{f' ({DESIRED_LEVERAGE}x unavailable, capped down)' if leverage < DESIRED_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {DESIRED_LEVERAGE}x)' if leverage > DESIRED_LEVERAGE else ''}\n"
             f"24h: {cand['pct_change_24h']:.2f}%  |  Signal: resistance ~{resistance:.6g} "
-            f"(2 consecutive 15m candles closed below level)\n"
+            f"(closed above level, then next candle closed below it)\n"
             f"No stop-loss set on this position. Use /sl {symbol} PRICE to set one, /tp {symbol} PRICE to change the take-profit."
         )
         send_telegram_message(entry_msg)
