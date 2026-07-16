@@ -1179,20 +1179,21 @@ def evaluate_resistance(symbol, current_price, candles=None,
 
 
 def get_strategy3_confirmed_resistance(symbol, candles):
-    """Strategy 3's own resistance signal: a break-and-reject confirmation,
-    entirely off candle closes (not the live ticker price the old bare-touch
-    check used).
+    """Strategy 3's own resistance signal: a wick-rejection + confirmation,
+    entirely off candle highs/closes (not the live ticker price the old
+    bare-touch check used).
 
-      Candle N:   CLOSES ABOVE a detected resistance level -> arms a pending
-                  confirmation for (symbol, level), returns None (no entry
-                  yet).
+      Candle N:   does NOT close above a detected resistance level, but its
+                  WICK (high) crosses above it -> a rejection candle. Arms a
+                  pending confirmation for (symbol, level), returns None (no
+                  entry yet).
       Candle N+1: the very next closed candle CLOSES BELOW that SAME level
                   -> returns the level (caller enters SHORT).
                   If it closes at/above the level instead, the pending
-                  confirmation is discarded (candle N's breakout held, so no
-                  short signal) — but that same candle N+1 can still arm its
-                  own new pending confirmation if it itself qualifies (see
-                  fallthrough below).
+                  confirmation is discarded (candle N's rejection didn't
+                  hold, so no short signal) — but that same candle N+1 can
+                  still arm its own new pending confirmation if it itself
+                  qualifies (see fallthrough below).
 
     "Very next candle" is enforced by checking that the previously-armed
     candle is exactly candles[-2] here, i.e. no candle was skipped in
@@ -1220,33 +1221,38 @@ def get_strategy3_confirmed_resistance(symbol, candles):
         if prev_ts == pending["candle_ts"]:
             level = pending["level"]
             if last_close < level:
-                print(f"  {symbol}: closed above resistance ~{level:.6g}, then the "
-                      f"very next 15m candle closed back below it — confirmed.")
+                print(f"  {symbol}: wick crossed resistance ~{level:.6g} while closing "
+                      f"below it, then the very next 15m candle also closed below it "
+                      f"— confirmed.")
                 return level
-            print(f"  {symbol}: closed above resistance ~{level:.6g} but the next "
-                  f"15m candle did NOT close back below it — confirmation failed, "
-                  f"not entering.")
+            print(f"  {symbol}: wick crossed resistance ~{level:.6g} while closing "
+                  f"below it, but the next 15m candle did NOT close below it — "
+                  f"confirmation failed, not entering.")
         else:
             print(f"  {symbol}: gap in candle history since arming (symbol likely "
                   f"dropped out of screening for a cycle) — pending confirmation "
                   f"discarded rather than confirming off a non-adjacent candle.")
         # Fall through to check whether this same latest candle itself arms a
-        # brand-new pending confirmation (e.g. it's its own close-above).
+        # brand-new pending confirmation (e.g. it's its own wick-rejection).
+
+    last_high = float(last_candle["h"])
 
     levels = find_resistance_levels(candles)
     for lvl in levels:
-        # Candle must CLOSE above the level to count as a breakout. Upper-
-        # bounded by the tolerance band so a level the price broke through
-        # long ago (and is now far above) doesn't keep re-arming on every
-        # scan — this only fires on a close that's freshly just above the
-        # level, mirroring the tolerance is_at_resistance() uses for
-        # strategy 1.
-        broke_above = lvl < last_close <= lvl * (1 + RESISTANCE_TOLERANCE_PCT / 100)
-        if broke_above:
+        # Candle must NOT close above the level (close stays below it), but
+        # its WICK (high) must cross above the level — a rejection candle:
+        # price poked through resistance intra-candle and got sold back
+        # down before the close. Upper-bounded by the tolerance band on the
+        # wick so a level the price wicked through long ago (and is now far
+        # above) doesn't keep re-arming on every scan — mirrors the
+        # tolerance is_at_resistance() uses for strategy 1.
+        wick_crossed = lvl < last_high <= lvl * (1 + RESISTANCE_TOLERANCE_PCT / 100)
+        closed_below = last_close < lvl
+        if wick_crossed and closed_below:
             strategy3_pending_confirmation[symbol] = {"level": lvl, "candle_ts": last_ts}
-            print(f"  {symbol}: 15m candle closed above resistance ~{lvl:.6g} — "
-                  f"waiting for the next candle to close back below it before "
-                  f"entering short.")
+            print(f"  {symbol}: 15m candle wick crossed resistance ~{lvl:.6g} but "
+                  f"closed below it (~{last_close:.6g}) — waiting for the next "
+                  f"candle to also close below it before entering short.")
             break
     return None
 
@@ -2383,7 +2389,7 @@ def send_help_message():
         "/strategy — show which strategy is currently active for new trades",
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
-        "/strategy3 — switch to Strategy 3 (close above resistance, then next candle closes below it, SHORT-only)",
+        "/strategy3 — switch to Strategy 3 (wick crosses resistance but candle closes below it, then next candle closes below it, SHORT-only)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
