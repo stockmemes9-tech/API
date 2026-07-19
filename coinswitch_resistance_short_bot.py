@@ -329,6 +329,50 @@ STRATEGY3_TP_CAPITAL_PCT = 5.0        # target: 5% profit on capital employed, s
 # below.
 STRATEGY3_REQUIRE_TWO_CANDLE_CONFIRMATION = True
 
+# ============================ STRATEGY 4 (BTC 15m EMA9 flip) ================
+# A fourth, completely separate strategy. Unlike strategies 1-3, this does
+# NOT run any market-wide screening at all (no top-200 exclusion, no 24h
+# drop/volume filter) — it always trades exactly one fixed symbol
+# (STRATEGY4_SYMBOL, default BTCUSDT) and is meant to flip position as often
+# as its signal changes, taking as many trades as the 15m chart gives it in
+# a day.
+#
+# Rule, both directions off the SAME 15m EMA9 line, always on the LATEST
+# CLOSED 15m candle (never the still-forming live candle):
+#   - flat + latest closed candle CLOSES ABOVE EMA9 -> go LONG
+#   - flat + latest closed candle CLOSES BELOW EMA9 -> go SHORT
+# Each position closes on WHICHEVER of these happens first:
+#   (a) its take-profit: STRATEGY4_TP_PRICE_MOVE_PCT (0.3%) price move in
+#       its favor (a flat price-move %, NOT a %-on-capital figure like
+#       strategies 1-3 use) — a resting reduce-only limit order, same as
+#       the other strategies place.
+#   (b) a later closed 15m candle closes back across EMA9 AGAINST the open
+#       position (LONG open + close < EMA9, or SHORT open + close > EMA9).
+#       This is checked every cycle by check_strategy4_signal_exits(),
+#       independent of whichever strategy is currently ACTIVE for new
+#       entries, same as reconcile_open_shorts()/check_liquidation_warnings()
+#       above — an open Strategy 4 position keeps getting this check even if
+#       you switch to Strategy 1/2/3 in the meantime.
+# Leverage: fixed at STRATEGY4_LEVERAGE (7x), falling back to the highest
+# leverage BTCUSDT actually allows if 7x isn't available (reuses
+# resolve_leverage(), unchanged, just with a different `desired`).
+# Capital: STRATEGY4_CAPITAL_INR, floored at 10,000 INR per your instruction
+# ("minimum 10000 rupees as capital") even if someone sets the env var lower.
+#
+# Deliberately exempt from the shared ENTRY_COOLDOWN_HOURS / LOSS_COOLDOWN_HOURS
+# re-entry cooldowns and the shared MAX_TRADES_PER_DAY cap that strategies 1-3
+# use (see enter_trades_strategy4()) — the only thing stopping a new entry
+# here is already having an open position on STRATEGY4_SYMBOL, or (in live
+# trading) not having enough free wallet balance for the next trade's margin.
+STRATEGY4_ENABLED = True
+STRATEGY4_SYMBOL = os.environ.get("STRATEGY4_SYMBOL", "BTCUSDT").strip().upper()
+STRATEGY4_EMA_PERIOD = 9
+STRATEGY4_KLINE_INTERVAL = "15"        # minutes; 15m chart, same granularity as strategy 1/3
+STRATEGY4_LOOKBACK_CANDLES = 150       # plenty of candles for a stable EMA9 seed
+STRATEGY4_LEVERAGE = 7
+STRATEGY4_CAPITAL_INR = max(10_000, int(os.environ.get("STRATEGY4_CAPITAL_INR", "10000")))
+STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital figure
+
 # symbol -> {"level": float, "candle_ts": <last confirmed candle's start_time>}
 # Only ever touched by the main scan-loop thread (enter_trades_strategy3()),
 # not by telegram_polling_loop, so unlike open_shorts/daily_trade_tracker it
@@ -344,7 +388,7 @@ strategy3_pending_confirmation = {}
 # the env var only matters until the first Telegram switch or a saved state
 # file is found.
 ACTIVE_STRATEGY_DEFAULT = os.environ.get("ACTIVE_STRATEGY", "1").strip()
-if ACTIVE_STRATEGY_DEFAULT not in ("1", "2", "3"):
+if ACTIVE_STRATEGY_DEFAULT not in ("1", "2", "3", "4"):
     ACTIVE_STRATEGY_DEFAULT = "1"
 
 # Mutable "which strategy is active" holder, guarded by state_lock same as
@@ -357,6 +401,7 @@ STRATEGY_NAMES = {
     "1": "resistance/RSI(77) LONG-only",
     "2": "RSI(14) 80/20 on 1h SHORT+LONG",
     "3": "resistance, close-above-then-close-below confirmation, SHORT-only",
+    "4": f"{STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, {STRATEGY4_LEVERAGE}x leverage",
 }
 
 # =============================================================================
@@ -1299,6 +1344,33 @@ def is_rsi_overbought_short_trigger(candles, threshold=RSI_OVERBOUGHT_SHORT_THRE
     return rsi_value > threshold, rsi_value
 
 
+def compute_ema_series(candles, period):
+    """Strategy 4's EMA9 helper. Returns a list the SAME LENGTH as `candles`,
+    where index i is the EMA value computed using only closes[0..i] (seeded
+    with a plain SMA over the first `period` closes at index period-1, the
+    standard EMA convention, then the usual exponential recursion after
+    that). Indices before the SMA seed has enough candles are None.
+
+    This is deliberately a full aligned series, not just a single trailing
+    number like compute_rsi() returns — Strategy 4 needs to compare EACH
+    closed candle's own close against its OWN EMA9 value as of that same
+    candle ("this candle closed above/below EMA9"), not just today's final
+    EMA number against today's price."""
+    closes = [float(c["c"]) for c in candles]
+    n = len(closes)
+    series = [None] * n
+    if n < period:
+        return series
+    sma_seed = sum(closes[:period]) / period
+    series[period - 1] = sma_seed
+    multiplier = 2 / (period + 1)
+    ema = sma_seed
+    for i in range(period, n):
+        ema = (closes[i] - ema) * multiplier + ema
+        series[i] = ema
+    return series
+
+
 def send_volume_debug(symbol):
     """Handles the /debugvolume SYMBOL command — fetches this symbol's most
     recent 15m candles and shows exactly what raw fields CoinSwitch returned
@@ -1864,6 +1936,118 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
         save_state(open_shorts, daily_trade_tracker)
 
 
+def check_strategy4_signal_exits(open_shorts, daily_trade_tracker):
+    """Runs every cycle, regardless of which strategy is currently ACTIVE for
+    NEW entries (same reasoning as reconcile_open_shorts/check_liquidation_
+    warnings — an open position keeps being monitored no matter what you
+    switch the active strategy to). If there's an open Strategy 4 position on
+    STRATEGY4_SYMBOL, checks whether the latest CLOSED 15m candle has closed
+    back across EMA9 against that position's direction:
+        LONG open  + latest close < EMA9 -> close (signal reversed)
+        SHORT open + latest close > EMA9 -> close (signal reversed)
+    This is the SECOND way a Strategy 4 position can close — the first being
+    its resting take-profit limit order (STRATEGY4_TP_PRICE_MOVE_PCT), which
+    reconcile_open_shorts() (called right before this, same cycle) already
+    catches if it filled. Whichever happens first wins; if reconcile already
+    removed the position this cycle (TP hit), open_shorts.get() below simply
+    returns None and this is a no-op.
+
+    Caller (run_once()) MUST already hold state_lock, same as
+    reconcile_open_shorts() — this reads-then-mutates open_shorts /
+    daily_trade_tracker, the same state a manual Telegram close touches."""
+    pos = open_shorts.get(STRATEGY4_SYMBOL)
+    if pos is None or pos.get("strategy") != "4":
+        return
+
+    try:
+        candles = get_klines(STRATEGY4_SYMBOL, interval=STRATEGY4_KLINE_INTERVAL,
+                              limit=STRATEGY4_LOOKBACK_CANDLES)
+    except Exception as e:
+        print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: klines fetch failed ({e}), "
+              f"leaving position open this cycle.")
+        return
+    if not candles:
+        return
+
+    ema_series = compute_ema_series(candles, STRATEGY4_EMA_PERIOD)
+    if ema_series[-1] is None:
+        return
+
+    latest_close = float(candles[-1]["c"])
+    latest_ema = ema_series[-1]
+    side = pos.get("side", "LONG")
+
+    should_exit = (
+        (side == "LONG" and latest_close < latest_ema) or
+        (side == "SHORT" and latest_close > latest_ema)
+    )
+    if not should_exit:
+        return
+
+    print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: latest 15m close {latest_close:.6g} is back "
+          f"across EMA9 ({latest_ema:.6g}) against the open {side} — closing on signal reversal.")
+
+    is_simulated = pos.get("simulated", DRY_RUN)
+    qty = pos.get("qty")
+    entry_price = pos.get("entry_price")
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    # Cancel the resting take-profit order first (real trades only) so it
+    # can't sit there and unexpectedly fill/interact after we've already
+    # market-closed the position out from under it.
+    if not is_simulated and pos.get("tp_order_id"):
+        try:
+            cancel_order(STRATEGY4_SYMBOL, pos["tp_order_id"])
+        except Exception as e:
+            print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: failed to cancel resting TP order "
+                  f"({e}), continuing with the market close anyway.")
+
+    if is_simulated:
+        # Nothing real was ever placed, so there's nothing to send a close
+        # order for — just book the exit at this candle's close price.
+        if entry_price is not None and qty is not None:
+            pnl = (
+                (latest_close - entry_price) * qty if side == "LONG"
+                else (entry_price - latest_close) * qty
+            )
+        else:
+            pnl = 0.0
+        print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: [DRY RUN] closing simulated {side} "
+              f"position, est P&L {pnl:+.2f} USDT.")
+    else:
+        try:
+            resp = place_order(STRATEGY4_SYMBOL, side=close_side, order_type="MARKET",
+                                quantity=qty, reduce_only=True)
+            print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: close order placed -> {resp['data']}")
+        except Exception as e:
+            print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: failed to place close order ({e}), "
+                  f"leaving position tracked as open.")
+            send_telegram_message(f"⚠️ Strategy 4 signal-exit close failed for {STRATEGY4_SYMBOL}: {e}")
+            return
+        time.sleep(2)  # give CoinSwitch a moment to settle the fill before pulling realized P&L
+        try:
+            pnl = get_realized_pnl(STRATEGY4_SYMBOL, pos["opened_at_ms"])
+        except Exception as e:
+            print(f"  [strategy4 exit] {STRATEGY4_SYMBOL}: P&L lookup failed ({e}), "
+                  f"closing with unknown P&L.")
+            pnl = 0.0
+
+    del open_shorts[STRATEGY4_SYMBOL]
+    daily_trade_tracker["realized_pnl_usdt"] += pnl
+    daily_trade_tracker["trades_closed"] += 1
+    if pnl >= 0:
+        daily_trade_tracker["wins"] += 1
+    else:
+        daily_trade_tracker["losses"] += 1
+    record_loss_cooldown(STRATEGY4_SYMBOL, pnl, daily_trade_tracker, int(time.time() * 1000))
+    record_trade_close(STRATEGY4_SYMBOL, pos, pnl, "strategy4_ema9_signal_exit")
+    save_state(open_shorts, daily_trade_tracker)
+    send_telegram_message(
+        f"{'[DRY RUN] ' if is_simulated else ''}[Strategy 4] {STRATEGY4_SYMBOL} closed on EMA9 "
+        f"signal reversal ({side} exited). P&L: {pnl:+.2f} USDT"
+    )
+
+
 # ------------------------------ Position monitoring ------------------------------
 
 def estimate_liquidation_price(entry_price, leverage, side="SHORT"):
@@ -2390,6 +2574,8 @@ def send_help_message():
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
         "/strategy3 — switch to Strategy 3 (wick crosses resistance but candle closes below it, then next candle closes below it, SHORT-only)",
+        f"/strategy4 — switch to Strategy 4 ({STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, "
+        f"{STRATEGY4_LEVERAGE}x, {STRATEGY4_TP_PRICE_MOVE_PCT:g}% TP or closes on EMA9 reversal)",
         "/pause — stop opening new trades (existing positions still monitored)",
         "/resume — re-enable new trade entries after /pause",
         "/help or /commands — this list",
@@ -2757,8 +2943,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         bot_paused.clear()
                         print("  [telegram] /resume — new entries re-enabled")
                         send_telegram_message("▶️ Resumed. Scanning for new entries again.")
-                elif text in ("/strategy1", "/strategy2", "/strategy3"):
-                    requested = text[-1]  # "1", "2", or "3"
+                elif text in ("/strategy1", "/strategy2", "/strategy3", "/strategy4"):
+                    requested = text[-1]  # "1", "2", "3", or "4"
                     with state_lock:
                         current = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
                         if current == requested:
@@ -2782,7 +2968,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         f"1 = resistance/RSI(77) LONG-only\n"
                         f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
                         f"3 = resistance close-above then close-below confirmation, SHORT-only\n"
-                        f"Switch with /strategy1, /strategy2, or /strategy3."
+                        f"4 = {STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, {STRATEGY4_LEVERAGE}x leverage\n"
+                        f"Switch with /strategy1, /strategy2, /strategy3, or /strategy4."
                     )
                 elif text in ("/help", "/commands"):
                     print("  [telegram] /help requested")
@@ -3436,6 +3623,175 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
     return available_balance_usdt
 
 
+def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
+                            daily_trade_tracker, open_shorts, now_ms):
+    """Strategy 4's entry loop — BTC-only 15m EMA9 flip system. Only called
+    when strategy 4 is the active strategy (see run_once()).
+
+    Unlike strategies 1-3, this does NOT go through screen_candidates()/
+    screen_candidates_v2() at all — it always looks at exactly one fixed
+    symbol (STRATEGY4_SYMBOL, default BTCUSDT), since the whole point is a
+    dedicated always-on BTC scalper, not a market-wide screener.
+
+    Rule (both directions off the same 15m EMA9 line):
+        - flat + latest CLOSED 15m candle closes ABOVE EMA9 -> go LONG
+        - flat + latest CLOSED 15m candle closes BELOW EMA9 -> go SHORT
+    Take-profit is a flat STRATEGY4_TP_PRICE_MOVE_PCT (0.3%) price move (not
+    a %-of-capital figure like strategies 1-3 use), placed as a resting
+    reduce-only limit order same as the others. The OTHER way this position
+    can close — a later candle closing back across EMA9 against it — is
+    handled every cycle regardless of the active strategy by
+    check_strategy4_signal_exits(), not here.
+
+    Deliberately skips the shared ENTRY_COOLDOWN_HOURS / LOSS_COOLDOWN_HOURS
+    re-entry cooldowns and the shared MAX_TRADES_PER_DAY cap that strategies
+    1-3 use — per instruction, this strategy is meant to flip position as
+    often as the 15m EMA9 signal changes and take as many trades as it can
+    in a day. The only real constraints left are: never open a second
+    position while one is already open on STRATEGY4_SYMBOL (the check right
+    below), and (in live trading) having enough free wallet balance for the
+    next trade's margin. Returns the (possibly decremented)
+    available_balance_usdt so the caller's wallet bookkeeping stays in sync,
+    same contract as enter_trades_strategy1/2/3."""
+    symbol = STRATEGY4_SYMBOL
+    if symbol in open_shorts:
+        # Already long or short — check_strategy4_signal_exits() (an EMA9
+        # reversal) and the resting take-profit order are what close it;
+        # nothing to do here until it's flat again.
+        return available_balance_usdt
+
+    order_margin_usdt = STRATEGY4_CAPITAL_INR / usdt_inr_rate
+    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+        print(f"  [strategy4] available balance {available_balance_usdt:.2f} USDT is below the "
+              f"{order_margin_usdt:.2f} USDT ({STRATEGY4_CAPITAL_INR:,} INR) needed for the next "
+              f"{symbol} trade — skipping this cycle.")
+        return available_balance_usdt
+
+    try:
+        candles = get_klines(symbol, interval=STRATEGY4_KLINE_INTERVAL, limit=STRATEGY4_LOOKBACK_CANDLES)
+    except Exception as e:
+        print(f"  [strategy4] {symbol}: klines fetch failed ({e}), skipping this cycle.")
+        return available_balance_usdt
+    if not candles:
+        print(f"  [strategy4] {symbol}: no candles returned, skipping this cycle.")
+        return available_balance_usdt
+
+    ema_series = compute_ema_series(candles, STRATEGY4_EMA_PERIOD)
+    if ema_series[-1] is None:
+        print(f"  [strategy4] {symbol}: not enough candles yet for EMA{STRATEGY4_EMA_PERIOD}, skipping.")
+        return available_balance_usdt
+
+    latest_close = float(candles[-1]["c"])
+    latest_ema = ema_series[-1]
+
+    if latest_close > latest_ema:
+        side = "LONG"
+    elif latest_close < latest_ema:
+        side = "SHORT"
+    else:
+        print(f"  [strategy4] {symbol}: latest close exactly equals EMA{STRATEGY4_EMA_PERIOD}, "
+              f"no signal this cycle.")
+        return available_balance_usdt
+
+    print(f"  >>> [strategy4] {symbol}: latest 15m candle closed {latest_close:.6g} vs EMA9 "
+          f"{latest_ema:.6g} -> {side} signal")
+
+    instrument = instruments.get(symbol)
+    if instrument is None:
+        print(f"      [strategy4] no instrument info for {symbol}, skipping order.")
+        return available_balance_usdt
+
+    leverage = resolve_leverage(instrument, desired=STRATEGY4_LEVERAGE)
+    if leverage < STRATEGY4_LEVERAGE:
+        print(f"      [strategy4] {symbol}: {STRATEGY4_LEVERAGE}x not available, using max "
+              f"{leverage}x instead.")
+    elif leverage > STRATEGY4_LEVERAGE:
+        print(f"      [strategy4] {symbol}: this symbol's own minimum leverage ({leverage}x) is "
+              f"above {STRATEGY4_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
+              f"leverage than desired.")
+    set_leverage(symbol, leverage)
+
+    entry_price = latest_close  # market order will fill close to the last closed candle's close
+    qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
+    price_precision = int(instrument.get("price_precision", 4))
+
+    entry_side = "BUY" if side == "LONG" else "SELL"
+    resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
+    opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP order below
+    print(f"      [strategy4] order response: {resp['data']}")
+    daily_trade_tracker["count"] += 1
+
+    # Same partial-fill handling as strategies 1-3 — size everything
+    # downstream off what actually filled, not what was requested.
+    try:
+        filled_qty = float(resp["data"].get("exec_quantity", qty))
+    except (TypeError, ValueError):
+        filled_qty = qty
+    if filled_qty <= 0:
+        print(f"      [strategy4] {symbol}: order response reports 0 filled quantity, skipping "
+              f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+        return available_balance_usdt
+    if filled_qty != qty:
+        print(f"      [strategy4] {symbol}: requested {qty}, filled {filled_qty} "
+              f"(partial fill) — sizing take-profit off the filled amount.")
+    available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
+    qty = filled_qty
+
+    # Take-profit: a flat STRATEGY4_TP_PRICE_MOVE_PCT (0.3%) price move in
+    # this trade's favor — direction-aware, same shape as strategy 2's TP
+    # but expressed directly as a price move rather than %-on-capital.
+    tp_pct = STRATEGY4_TP_PRICE_MOVE_PCT / 100
+    if side == "LONG":
+        tp_price = round(entry_price * (1 + tp_pct), price_precision)
+        tp_close_side = "SELL"
+    else:
+        tp_price = round(entry_price * (1 - tp_pct), price_precision)
+        tp_close_side = "BUY"
+
+    tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
+                           quantity=qty, price=tp_price, reduce_only=True)
+    tp_order_id = tp_resp["data"].get("order_id")
+    print(f"      [strategy4] take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price "
+          f"move): {tp_resp['data']}")
+
+    entry_msg = (
+        f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 4] {side} {symbol}\n"
+        f"Entry: {entry_price} (market)  |  Qty: {qty}  |  Leverage: {leverage}x"
+        f"{f' ({STRATEGY4_LEVERAGE}x unavailable, capped down)' if leverage < STRATEGY4_LEVERAGE else ''}"
+        f"{f' (symbol minimum forced leverage UP from {STRATEGY4_LEVERAGE}x)' if leverage > STRATEGY4_LEVERAGE else ''}\n"
+        f"Signal: 15m candle closed {'above' if side == 'LONG' else 'below'} EMA9 "
+        f"({latest_close:.6g} vs {latest_ema:.6g})\n"
+        f"Take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price move) — OR closes early "
+        f"if a later 15m candle closes back across EMA9 against this position.\n"
+        f"No stop-loss set. Use /sl {symbol} PRICE to set one."
+    )
+    send_telegram_message(entry_msg)
+
+    with state_lock:
+        open_shorts[symbol] = {
+            "entry_price": entry_price,
+            "qty": qty,
+            "tp_price": tp_price,
+            "tp_order_id": tp_order_id,
+            "sl_price": None,               # no stop-loss by default — set manually via /sl
+            "sl_order_id": None,
+            "price_precision": price_precision,
+            "opened_at_ms": opened_at_ms,
+            "simulated": DRY_RUN,
+            "leverage": leverage,
+            "liquidation_warning_sent": False,
+            "side": side,
+            "strategy": "4",
+        }
+        # Recorded for visibility in /cooldowns etc., even though strategy 4's
+        # own entry logic above never checks it — see the docstring for why
+        # this strategy is exempt from the shared re-entry cooldown.
+        daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
+        save_state(open_shorts, daily_trade_tracker)
+
+    return available_balance_usdt
+
+
 def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_trade_tracker,
              last_market_refresh_date, last_status_update_ms):
     try:
@@ -3450,6 +3806,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # close can't interleave mid-reconcile and corrupt the shared dicts.
     with state_lock:
         reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker)
+
+        # Strategy 4's EMA9-reversal exit — runs every cycle regardless of
+        # which strategy is currently ACTIVE for new entries, same as
+        # reconcile_open_shorts() just above (see check_strategy4_signal_
+        # exits()'s docstring). No-op if there's no open Strategy 4 position.
+        check_strategy4_signal_exits(open_shorts, daily_trade_tracker)
 
         # Liquidation-distance check runs every cycle (not on the 15-minute
         # status timer) since an adverse move can cross the warning threshold
@@ -3526,6 +3888,11 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     if active_strategy in ("1", "3"):
         candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
         filter_desc = "market-cap/drop/volume"
+    elif active_strategy == "4":
+        # No market-wide screening at all — strategy 4 always trades exactly
+        # one fixed symbol (see enter_trades_strategy4()).
+        candidates = []
+        filter_desc = f"{STRATEGY4_SYMBOL}-only EMA9 flip (strategy 4)"
     else:
         candidates = screen_candidates_v2(tickers, top_cap_symbols)
         filter_desc = "market-cap-only (strategy 2)"
@@ -3586,6 +3953,11 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             candidates, instruments, order_margin_usdt, available_balance_usdt,
             daily_trade_tracker, open_shorts, cooldown_cutoff_ms, now_ms,
             loss_cooldown_cutoff_ms=loss_cooldown_cutoff_ms,
+        )
+    elif active_strategy == "4":
+        available_balance_usdt = enter_trades_strategy4(
+            instruments, usdt_inr_rate, available_balance_usdt,
+            daily_trade_tracker, open_shorts, now_ms,
         )
     else:
         available_balance_usdt = enter_trades_strategy2(
@@ -3670,7 +4042,7 @@ def main():
         f"/cooldowns to see symbols on the {ENTRY_COOLDOWN_HOURS}h re-entry cooldown, "
         f"/debugvolume SYMBOL to inspect raw kline volume data, "
         f"/tp SYMBOL PRICE or /sl SYMBOL PRICE to change a position's take-profit or stop-loss (0 removes it), "
-        f"/strategy to check the active strategy, /strategy1, /strategy2, or /strategy3 to switch, "
+        f"/strategy to check the active strategy, /strategy1, /strategy2, /strategy3, or /strategy4 to switch, "
         f"/pause to stop new entries, /resume to re-enable them."
     )
 
