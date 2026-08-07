@@ -376,9 +376,11 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # ============================ STRATEGY 5 ("RE Strategy", EMA9/21 cross) =====
 # A fifth, completely separate strategy — ported live from the standalone
 # backtest_strategy_ema9_ema21_cross.py script. Like strategy 4, this does
-# NOT run any market-wide screening — it always trades exactly one fixed
-# symbol (STRATEGY5_SYMBOL, default REUSDT, matching the backtest script's
-# own default).
+# NOT run any market-wide screening — it only ever trades the fixed list of
+# symbols in STRATEGY5_SYMBOLS (default REUSDT,SAHARAUSDT,CCUSDT — REUSDT
+# matches the backtest script's own default; SAHARAUSDT/CCUSDT were added
+# on top of it). Each symbol in the list is evaluated independently every
+# cycle and can have its own open position at the same time.
 #
 # Rule, evaluated on the latest CLOSED candle only (see
 # compute_ema_cross_signal()):
@@ -412,7 +414,20 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # — the only real gate is already having an open position on this symbol, or
 # (in live trading) not having enough free wallet balance for the margin.
 STRATEGY5_ENABLED = True
-STRATEGY5_SYMBOL = os.environ.get("STRATEGY5_SYMBOL", "REUSDT").strip().upper()
+# Comma-separated list of symbols this strategy trades, e.g.
+# "REUSDT,SAHARAUSDT,CCUSDT". Override via the STRATEGY5_SYMBOLS env var
+# (still comma-separated). STRATEGY5_SYMBOL (singular) is kept as a
+# backward-compatible override for a single-symbol deploy — if it's set and
+# STRATEGY5_SYMBOLS isn't, it's used instead of the default list.
+_STRATEGY5_SYMBOLS_DEFAULT = "REUSDT,SAHARAUSDT,CCUSDT"
+STRATEGY5_SYMBOLS = [
+    s.strip().upper()
+    for s in os.environ.get(
+        "STRATEGY5_SYMBOLS",
+        os.environ.get("STRATEGY5_SYMBOL", _STRATEGY5_SYMBOLS_DEFAULT),
+    ).split(",")
+    if s.strip()
+]
 STRATEGY5_EMA_FAST = 9
 STRATEGY5_EMA_SLOW = 21
 # Minutes per candle. NOTE: the backtest script's docstring describes a DAILY
@@ -458,7 +473,7 @@ STRATEGY_NAMES = {
     "2": "RSI(14) 80/20 on 1h SHORT+LONG",
     "3": "resistance, close-above-then-close-below confirmation, SHORT-only",
     "4": f"{STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, {STRATEGY4_LEVERAGE}x leverage",
-    "5": f"RE Strategy — {STRATEGY5_SYMBOL} {STRATEGY5_KLINE_INTERVAL}m EMA9/EMA21 cross, "
+    "5": f"RE Strategy — {', '.join(STRATEGY5_SYMBOLS)} {STRATEGY5_KLINE_INTERVAL}m EMA9/EMA21 cross, "
          f"LONG+SHORT, {STRATEGY5_LEVERAGE}x leverage, {STRATEGY5_TP_PCT:g}% TP / {STRATEGY5_SL_PCT:g}% SL",
 }
 
@@ -2675,7 +2690,7 @@ def send_help_message():
         "/strategy3 — switch to Strategy 3 (wick crosses resistance but candle closes below it, then next candle closes below it, SHORT-only)",
         f"/strategy4 — switch to Strategy 4 ({STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, "
         f"{STRATEGY4_LEVERAGE}x, {STRATEGY4_TP_PRICE_MOVE_PCT:g}% TP or closes on EMA9 reversal)",
-        f"/strategy5 — switch to Strategy 5 / RE Strategy ({STRATEGY5_SYMBOL} "
+        f"/strategy5 — switch to Strategy 5 / RE Strategy ({', '.join(STRATEGY5_SYMBOLS)} "
         f"{STRATEGY5_KLINE_INTERVAL}m EMA9/EMA21 cross, LONG+SHORT, {STRATEGY5_LEVERAGE}x, "
         f"{STRATEGY5_TP_PCT:g}% TP / {STRATEGY5_SL_PCT:g}% SL, whichever hits first)",
         "/pause — stop opening new trades (existing positions still monitored)",
@@ -3071,7 +3086,7 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         f"2 = RSI(14) 80/20 on 1h SHORT+LONG\n"
                         f"3 = resistance close-above then close-below confirmation, SHORT-only\n"
                         f"4 = {STRATEGY4_SYMBOL} 15m EMA9 flip, LONG+SHORT, {STRATEGY4_LEVERAGE}x leverage\n"
-                        f"5 = RE Strategy — {STRATEGY5_SYMBOL} {STRATEGY5_KLINE_INTERVAL}m EMA9/EMA21 cross, "
+                        f"5 = RE Strategy — {', '.join(STRATEGY5_SYMBOLS)} {STRATEGY5_KLINE_INTERVAL}m EMA9/EMA21 cross, "
                         f"LONG+SHORT, {STRATEGY5_LEVERAGE}x leverage, {STRATEGY5_TP_PCT:g}% TP / "
                         f"{STRATEGY5_SL_PCT:g}% SL\n"
                         f"Switch with /strategy1, /strategy2, /strategy3, /strategy4, or /strategy5."
@@ -3899,12 +3914,13 @@ def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
 
 def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                             daily_trade_tracker, open_shorts, now_ms):
-    """Strategy 5's ("RE Strategy") entry loop — a fixed-symbol EMA9/EMA21
+    """Strategy 5's ("RE Strategy") entry loop — a fixed-symbol-list EMA9/EMA21
     crossover system, ported live from backtest_strategy_ema9_ema21_cross.py.
     Only called when strategy 5 is the active strategy (see run_once()).
     Like strategy 4, this does NOT go through screen_candidates() at all — it
-    always looks at exactly one fixed symbol (STRATEGY5_SYMBOL, default
-    REUSDT).
+    only ever looks at the fixed symbols in STRATEGY5_SYMBOLS (default
+    REUSDT, SAHARAUSDT, CCUSDT), evaluated independently one at a time in the
+    loop below.
 
     Rule, evaluated on the latest CLOSED candle only (see
     compute_ema_cross_signal()): flat + a fresh EMA9/EMA21 crossover event on
@@ -3923,157 +3939,158 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
 
     Same as strategy 4: exempt from the shared ENTRY_COOLDOWN_HOURS/
     LOSS_COOLDOWN_HOURS re-entry cooldowns and the MAX_TRADES_PER_DAY cap —
-    the only real gate is already having an open position on this symbol, or
-    (in live trading) not having enough free wallet balance for the next
-    trade's margin. Returns the (possibly decremented) available_balance_usdt,
-    same contract as enter_trades_strategy1/2/3/4."""
-    symbol = STRATEGY5_SYMBOL
-    if symbol in open_shorts:
-        # Already in a position — it closes via its resting TP/SL orders,
-        # picked up next cycle by reconcile_open_shorts(). Nothing to do here
-        # until it's flat again.
-        return available_balance_usdt
+    the only real gate per-symbol is already having an open position on that
+    symbol, or (in live trading) not having enough free wallet balance left
+    for the next trade's margin. Returns the (possibly decremented)
+    available_balance_usdt, same contract as enter_trades_strategy1/2/3/4."""
+    for symbol in STRATEGY5_SYMBOLS:
+        if symbol in open_shorts:
+            # Already in a position on this symbol — it closes via its
+            # resting TP/SL orders, picked up next cycle by
+            # reconcile_open_shorts(). Nothing to do here until it's flat
+            # again. Move on and check the next symbol in the list.
+            continue
 
-    order_margin_usdt = STRATEGY5_CAPITAL_INR / usdt_inr_rate
-    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
-        print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({STRATEGY5_CAPITAL_INR:,} INR) needed for the next "
-              f"{symbol} trade — skipping this cycle.")
-        return available_balance_usdt
+        order_margin_usdt = STRATEGY5_CAPITAL_INR / usdt_inr_rate
+        if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+            print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
+                  f"{order_margin_usdt:.2f} USDT ({STRATEGY5_CAPITAL_INR:,} INR) needed for the next "
+                  f"{symbol} trade — skipping this symbol this cycle.")
+            continue
 
-    try:
-        candles = get_klines(symbol, interval=STRATEGY5_KLINE_INTERVAL, limit=STRATEGY5_LOOKBACK_CANDLES)
-    except Exception as e:
-        print(f"  [strategy5] {symbol}: klines fetch failed ({e}), skipping this cycle.")
-        return available_balance_usdt
-    if not candles:
-        print(f"  [strategy5] {symbol}: no candles returned, skipping this cycle.")
-        return available_balance_usdt
-
-    signal_side = compute_ema_cross_signal(candles, STRATEGY5_EMA_FAST, STRATEGY5_EMA_SLOW)
-    side = signal_side[-1]
-    if side is None:
-        return available_balance_usdt
-
-    latest_close = float(candles[-1]["c"])
-    print(f"  >>> [strategy5] {symbol}: fresh EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} "
-          f"crossover confirmed by close ({latest_close:.6g}) on the latest closed "
-          f"{STRATEGY5_KLINE_INTERVAL}m candle -> {side} signal")
-
-    instrument = instruments.get(symbol)
-    if instrument is None:
-        print(f"      [strategy5] no instrument info for {symbol}, skipping order.")
-        return available_balance_usdt
-
-    leverage = resolve_leverage(instrument, desired=STRATEGY5_LEVERAGE)
-    if leverage < STRATEGY5_LEVERAGE:
-        print(f"      [strategy5] {symbol}: {STRATEGY5_LEVERAGE}x not available, using max "
-              f"{leverage}x instead.")
-    elif leverage > STRATEGY5_LEVERAGE:
-        print(f"      [strategy5] {symbol}: this symbol's own minimum leverage ({leverage}x) is "
-              f"above {STRATEGY5_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
-              f"leverage than desired.")
-    set_leverage(symbol, leverage)
-
-    entry_price = latest_close  # market order will fill close to the latest closed candle's close
-    qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
-    price_precision = int(instrument.get("price_precision", 4))
-
-    entry_side = "BUY" if side == "LONG" else "SELL"
-    resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
-    opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP/SL orders below
-    print(f"      [strategy5] order response: {resp['data']}")
-    daily_trade_tracker["count"] += 1
-
-    # Same partial-fill handling as strategies 1-4 — size everything
-    # downstream off what actually filled, not what was requested.
-    try:
-        filled_qty = float(resp["data"].get("exec_quantity", qty))
-    except (TypeError, ValueError):
-        filled_qty = qty
-    if filled_qty <= 0:
-        print(f"      [strategy5] {symbol}: order response reports 0 filled quantity, skipping "
-              f"TP/SL placement and not tracking a position. Raw: {resp['data']}")
-        return available_balance_usdt
-    if filled_qty != qty:
-        print(f"      [strategy5] {symbol}: requested {qty}, filled {filled_qty} "
-              f"(partial fill) — sizing TP/SL off the filled amount.")
-    available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
-    qty = filled_qty
-
-    # Take-profit AND stop-loss are both flat STRATEGY5_TP_PCT/STRATEGY5_SL_PCT
-    # price moves off entry (not %-of-capital figures) — direction-aware,
-    # same shape as strategy 4's TP but with a symmetric SL added, matching
-    # the backtest's "closes on whichever of TP/SL hits first" rule.
-    tp_pct = STRATEGY5_TP_PCT / 100
-    sl_pct = STRATEGY5_SL_PCT / 100
-    if side == "LONG":
-        tp_price = round(entry_price * (1 + tp_pct), price_precision)
-        sl_price = round(entry_price * (1 - sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
-        close_side = "SELL"
-    else:
-        tp_price = round(entry_price * (1 - tp_pct), price_precision)
-        sl_price = round(entry_price * (1 + sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
-        close_side = "BUY"
-
-    tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
-                           quantity=qty, price=tp_price, reduce_only=True)
-    tp_order_id = tp_resp["data"].get("order_id")
-    print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): {tp_resp['data']}")
-
-    sl_order_id = None
-    if sl_price is not None:
         try:
-            sl_resp = place_order(symbol, side=close_side, order_type="STOP_MARKET",
-                                   quantity=qty, trigger_price=sl_price, reduce_only=True)
-            sl_order_id = sl_resp["data"].get("order_id")
-            print(f"      [strategy5] stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}% price move): "
-                  f"{sl_resp['data']}")
+            candles = get_klines(symbol, interval=STRATEGY5_KLINE_INTERVAL, limit=STRATEGY5_LOOKBACK_CANDLES)
         except Exception as e:
-            # Don't abort the whole entry over a failed SL placement — the
-            # position is already open with a real take-profit resting.
-            # Flag it loudly instead so it doesn't silently run without a
-            # stop-loss.
-            print(f"      [strategy5] {symbol}: failed to place stop-loss order ({e}) — "
-                  f"position will run with take-profit only until you set one manually via /sl.")
-            send_telegram_message(
-                f"⚠️ [Strategy 5] {symbol} stop-loss order failed to place: {e}. "
-                f"Position is open with take-profit only — use /sl {symbol} PRICE to set one manually."
-            )
+            print(f"  [strategy5] {symbol}: klines fetch failed ({e}), skipping this cycle.")
+            continue
+        if not candles:
+            print(f"  [strategy5] {symbol}: no candles returned, skipping this cycle.")
+            continue
 
-    entry_msg = (
-        f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 5 — RE] {side} {symbol}\n"
-        f"Entry: {entry_price} (market)  |  Qty: {qty}  |  Leverage: {leverage}x"
-        f"{f' ({STRATEGY5_LEVERAGE}x unavailable, capped down)' if leverage < STRATEGY5_LEVERAGE else ''}"
-        f"{f' (symbol minimum forced leverage UP from {STRATEGY5_LEVERAGE}x)' if leverage > STRATEGY5_LEVERAGE else ''}\n"
-        f"Signal: EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} crossover on "
-        f"{STRATEGY5_KLINE_INTERVAL}m candles, confirmed by close\n"
-        f"Take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}%)"
-        + (f"  |  Stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}%)" if sl_price is not None else "  |  No stop-loss set")
-        + "\nCloses on WHICHEVER of TP/SL hits first — no signal-reversal exit for this strategy."
-    )
-    send_telegram_message(entry_msg)
+        signal_side = compute_ema_cross_signal(candles, STRATEGY5_EMA_FAST, STRATEGY5_EMA_SLOW)
+        side = signal_side[-1]
+        if side is None:
+            continue
 
-    with state_lock:
-        open_shorts[symbol] = {
-            "entry_price": entry_price,
-            "qty": qty,
-            "tp_price": tp_price,
-            "tp_order_id": tp_order_id,
-            "sl_price": sl_price,
-            "sl_order_id": sl_order_id,
-            "price_precision": price_precision,
-            "opened_at_ms": opened_at_ms,
-            "simulated": DRY_RUN,
-            "leverage": leverage,
-            "liquidation_warning_sent": False,
-            "side": side,
-            "strategy": "5",
-        }
-        # Recorded for visibility in /cooldowns etc., even though strategy 5's
-        # own entry logic above never checks it — same exemption as strategy 4.
-        daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
-        save_state(open_shorts, daily_trade_tracker)
+        latest_close = float(candles[-1]["c"])
+        print(f"  >>> [strategy5] {symbol}: fresh EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} "
+              f"crossover confirmed by close ({latest_close:.6g}) on the latest closed "
+              f"{STRATEGY5_KLINE_INTERVAL}m candle -> {side} signal")
+
+        instrument = instruments.get(symbol)
+        if instrument is None:
+            print(f"      [strategy5] no instrument info for {symbol}, skipping order.")
+            continue
+
+        leverage = resolve_leverage(instrument, desired=STRATEGY5_LEVERAGE)
+        if leverage < STRATEGY5_LEVERAGE:
+            print(f"      [strategy5] {symbol}: {STRATEGY5_LEVERAGE}x not available, using max "
+                  f"{leverage}x instead.")
+        elif leverage > STRATEGY5_LEVERAGE:
+            print(f"      [strategy5] {symbol}: this symbol's own minimum leverage ({leverage}x) is "
+                  f"above {STRATEGY5_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
+                  f"leverage than desired.")
+        set_leverage(symbol, leverage)
+
+        entry_price = latest_close  # market order will fill close to the latest closed candle's close
+        qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
+        price_precision = int(instrument.get("price_precision", 4))
+
+        entry_side = "BUY" if side == "LONG" else "SELL"
+        resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
+        opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP/SL orders below
+        print(f"      [strategy5] order response: {resp['data']}")
+        daily_trade_tracker["count"] += 1
+
+        # Same partial-fill handling as strategies 1-4 — size everything
+        # downstream off what actually filled, not what was requested.
+        try:
+            filled_qty = float(resp["data"].get("exec_quantity", qty))
+        except (TypeError, ValueError):
+            filled_qty = qty
+        if filled_qty <= 0:
+            print(f"      [strategy5] {symbol}: order response reports 0 filled quantity, skipping "
+                  f"TP/SL placement and not tracking a position. Raw: {resp['data']}")
+            continue
+        if filled_qty != qty:
+            print(f"      [strategy5] {symbol}: requested {qty}, filled {filled_qty} "
+                  f"(partial fill) — sizing TP/SL off the filled amount.")
+        available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
+        qty = filled_qty
+
+        # Take-profit AND stop-loss are both flat STRATEGY5_TP_PCT/STRATEGY5_SL_PCT
+        # price moves off entry (not %-of-capital figures) — direction-aware,
+        # same shape as strategy 4's TP but with a symmetric SL added, matching
+        # the backtest's "closes on whichever of TP/SL hits first" rule.
+        tp_pct = STRATEGY5_TP_PCT / 100
+        sl_pct = STRATEGY5_SL_PCT / 100
+        if side == "LONG":
+            tp_price = round(entry_price * (1 + tp_pct), price_precision)
+            sl_price = round(entry_price * (1 - sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
+            close_side = "SELL"
+        else:
+            tp_price = round(entry_price * (1 - tp_pct), price_precision)
+            sl_price = round(entry_price * (1 + sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
+            close_side = "BUY"
+
+        tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
+                               quantity=qty, price=tp_price, reduce_only=True)
+        tp_order_id = tp_resp["data"].get("order_id")
+        print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): {tp_resp['data']}")
+
+        sl_order_id = None
+        if sl_price is not None:
+            try:
+                sl_resp = place_order(symbol, side=close_side, order_type="STOP_MARKET",
+                                       quantity=qty, trigger_price=sl_price, reduce_only=True)
+                sl_order_id = sl_resp["data"].get("order_id")
+                print(f"      [strategy5] stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}% price move): "
+                      f"{sl_resp['data']}")
+            except Exception as e:
+                # Don't abort the whole entry over a failed SL placement — the
+                # position is already open with a real take-profit resting.
+                # Flag it loudly instead so it doesn't silently run without a
+                # stop-loss.
+                print(f"      [strategy5] {symbol}: failed to place stop-loss order ({e}) — "
+                      f"position will run with take-profit only until you set one manually via /sl.")
+                send_telegram_message(
+                    f"⚠️ [Strategy 5] {symbol} stop-loss order failed to place: {e}. "
+                    f"Position is open with take-profit only — use /sl {symbol} PRICE to set one manually."
+                )
+
+        entry_msg = (
+            f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 5 — RE] {side} {symbol}\n"
+            f"Entry: {entry_price} (market)  |  Qty: {qty}  |  Leverage: {leverage}x"
+            f"{f' ({STRATEGY5_LEVERAGE}x unavailable, capped down)' if leverage < STRATEGY5_LEVERAGE else ''}"
+            f"{f' (symbol minimum forced leverage UP from {STRATEGY5_LEVERAGE}x)' if leverage > STRATEGY5_LEVERAGE else ''}\n"
+            f"Signal: EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} crossover on "
+            f"{STRATEGY5_KLINE_INTERVAL}m candles, confirmed by close\n"
+            f"Take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}%)"
+            + (f"  |  Stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}%)" if sl_price is not None else "  |  No stop-loss set")
+            + "\nCloses on WHICHEVER of TP/SL hits first — no signal-reversal exit for this strategy."
+        )
+        send_telegram_message(entry_msg)
+
+        with state_lock:
+            open_shorts[symbol] = {
+                "entry_price": entry_price,
+                "qty": qty,
+                "tp_price": tp_price,
+                "tp_order_id": tp_order_id,
+                "sl_price": sl_price,
+                "sl_order_id": sl_order_id,
+                "price_precision": price_precision,
+                "opened_at_ms": opened_at_ms,
+                "simulated": DRY_RUN,
+                "leverage": leverage,
+                "liquidation_warning_sent": False,
+                "side": side,
+                "strategy": "5",
+            }
+            # Recorded for visibility in /cooldowns etc., even though strategy 5's
+            # own entry logic above never checks it — same exemption as strategy 4.
+            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
+            save_state(open_shorts, daily_trade_tracker)
 
     return available_balance_usdt
 
@@ -4180,10 +4197,10 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         candidates = []
         filter_desc = f"{STRATEGY4_SYMBOL}-only EMA9 flip (strategy 4)"
     elif active_strategy == "5":
-        # No market-wide screening at all — strategy 5 ("RE Strategy") always
-        # trades exactly one fixed symbol (see enter_trades_strategy5()).
+        # No market-wide screening at all — strategy 5 ("RE Strategy") only
+        # trades its fixed symbol list (see enter_trades_strategy5()).
         candidates = []
-        filter_desc = f"{STRATEGY5_SYMBOL}-only EMA9/EMA21 cross (strategy 5, RE Strategy)"
+        filter_desc = f"{', '.join(STRATEGY5_SYMBOLS)}-only EMA9/EMA21 cross (strategy 5, RE Strategy)"
     else:
         candidates = screen_candidates_v2(tickers, top_cap_symbols)
         filter_desc = "market-cap-only (strategy 2)"
