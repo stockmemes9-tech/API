@@ -406,8 +406,8 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 #
 # Leverage: fixed at STRATEGY5_LEVERAGE, falling back to the highest leverage
 # the symbol actually allows if that's not available (resolve_leverage(),
-# same as strategies 2/4). Capital: STRATEGY5_CAPITAL_INR, floored at 10,000
-# INR same as strategy 4's floor.
+# same as strategies 2/4). Capital: STRATEGY5_CAPITAL_INR, floored at 8,000
+# INR (lower than strategy 4's 10,000 floor).
 #
 # Deliberately exempt from the shared ENTRY_COOLDOWN_HOURS/LOSS_COOLDOWN_HOURS
 # re-entry cooldowns and MAX_TRADES_PER_DAY cap, same reasoning as strategy 4
@@ -440,7 +440,7 @@ STRATEGY5_EMA_SLOW = 21
 STRATEGY5_KLINE_INTERVAL = os.environ.get("STRATEGY5_KLINE_INTERVAL", "60").strip()
 STRATEGY5_LOOKBACK_CANDLES = 150       # plenty of candles for a stable EMA21 seed
 STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage default
-STRATEGY5_CAPITAL_INR = max(10_000, int(os.environ.get("STRATEGY5_CAPITAL_INR", "10000")))
+STRATEGY5_CAPITAL_INR = max(8_000, int(os.environ.get("STRATEGY5_CAPITAL_INR", "8000")))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
