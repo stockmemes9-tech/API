@@ -407,10 +407,12 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 #
 # Leverage: fixed at STRATEGY5_LEVERAGE, falling back to the highest leverage
 # the symbol actually allows if that's not available (resolve_leverage(),
-# same as strategies 2/4). Capital: STRATEGY5_CAPITAL_USDT, a flat USDT
-# margin figure (default/floor 80 USDT) rather than an INR figure converted
-# at the live rate — set directly in USDT since this strategy's minimum
-# wallet requirement was specified in USDT, not INR.
+# same as strategies 2/4). Capital: sized per-trade in the
+# STRATEGY5_MIN_TRADE_USDT-STRATEGY5_MAX_TRADE_USDT USDT range (default
+# 77-80 USDT) rather than an INR figure converted at the live rate — set
+# directly in USDT since this strategy's wallet/trade-size requirement was
+# specified in USDT, not INR. Entries are placed as LIMIT orders at the
+# latest closed candle's close (i.e. the current price), not MARKET.
 #
 # Deliberately exempt from the shared ENTRY_COOLDOWN_HOURS/LOSS_COOLDOWN_HOURS
 # re-entry cooldowns and MAX_TRADES_PER_DAY cap, same reasoning as strategy 4
@@ -443,18 +445,15 @@ STRATEGY5_EMA_SLOW = 21
 STRATEGY5_KLINE_INTERVAL = os.environ.get("STRATEGY5_KLINE_INTERVAL", "60").strip()
 STRATEGY5_LOOKBACK_CANDLES = 150       # plenty of candles for a stable EMA21 seed
 STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage default
-STRATEGY5_CAPITAL_USDT = max(80, int(os.environ.get("STRATEGY5_CAPITAL_USDT", "80")))
-# Extra headroom required ON TOP OF STRATEGY5_CAPITAL_USDT before attempting
-# a trade — NOT part of the position size itself (compute_quantity() below
-# still sizes off STRATEGY5_CAPITAL_USDT exactly). This exists because entry
-# sizing uses the latest CLOSED 60m candle's price, which can be up to ~1h
-# stale by the time a MARKET order actually reaches CoinSwitch's matching
-# engine; on a volatile low-cap symbol that drift (plus taker fees) is
-# enough to turn a wallet balance that's only just above the flat capital
-# figure into a real "Insufficient balance" rejection from the exchange —
-# observed live with an 81.57 USDT balance against an 80 USDT requirement.
-# Default 5% -> requires 84 USDT free before even trying an 80 USDT trade.
-STRATEGY5_BALANCE_BUFFER_PCT = float(os.environ.get("STRATEGY5_BALANCE_BUFFER_PCT", "5"))
+# Per-trade margin range, in flat USDT (not INR-converted). The minimum
+# wallet balance required before even attempting a trade is
+# STRATEGY5_MIN_TRADE_USDT — no extra buffer on top of it, since entries are
+# now LIMIT orders at the current price rather than MARKET orders (which is
+# what previously required headroom for post-signal price drift). The
+# actual trade size is whatever's free in the wallet, capped at
+# STRATEGY5_MAX_TRADE_USDT, so it naturally lands in the 77-80 USDT range.
+STRATEGY5_MIN_TRADE_USDT = float(os.environ.get("STRATEGY5_MIN_TRADE_USDT", "77"))
+STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "80"))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
@@ -4028,18 +4027,18 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             # again. Move on and check the next symbol in the list.
             continue
 
-        order_margin_usdt = STRATEGY5_CAPITAL_USDT
-        # Require a small buffer above the flat capital figure, not just
-        # >= it — see STRATEGY5_BALANCE_BUFFER_PCT's docstring above for why
-        # an exact-or-barely-above balance still risks a real "Insufficient
-        # balance" rejection from the exchange on a volatile symbol.
-        required_with_buffer = order_margin_usdt * (1 + STRATEGY5_BALANCE_BUFFER_PCT / 100)
-        if not DRY_RUN and available_balance_usdt < required_with_buffer:
+        # Minimum wallet balance required before even attempting a trade —
+        # the trade itself is then sized off whatever's actually free, capped
+        # at STRATEGY5_MAX_TRADE_USDT, so it lands in the 77-80 USDT range.
+        if not DRY_RUN and available_balance_usdt < STRATEGY5_MIN_TRADE_USDT:
             print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
-                  f"{required_with_buffer:.2f} USDT needed ({order_margin_usdt:.2f} USDT trade + "
-                  f"{STRATEGY5_BALANCE_BUFFER_PCT:.0f}% buffer) for the next "
+                  f"{STRATEGY5_MIN_TRADE_USDT:.2f} USDT minimum needed for the next "
                   f"{symbol} trade — skipping this symbol this cycle.")
             continue
+        order_margin_usdt = (
+            min(available_balance_usdt, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
+            else STRATEGY5_MAX_TRADE_USDT
+        )
 
         try:
             candles = get_klines(symbol, interval=STRATEGY5_KLINE_INTERVAL, limit=STRATEGY5_LOOKBACK_CANDLES)
@@ -4075,12 +4074,12 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                   f"leverage than desired.")
         set_leverage(symbol, leverage)
 
-        entry_price = latest_close  # market order will fill close to the latest closed candle's close
-        qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
         price_precision = int(instrument.get("price_precision", 4))
+        entry_price = round(latest_close, price_precision)  # LIMIT order resting at the current price
+        qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
 
         entry_side = "BUY" if side == "LONG" else "SELL"
-        resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
+        resp = place_order(symbol, side=entry_side, order_type="LIMIT", quantity=qty, price=entry_price)
         opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP/SL orders below
         print(f"      [strategy5] order response: {resp['data']}")
         daily_trade_tracker["count"] += 1
@@ -4092,8 +4091,13 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         except (TypeError, ValueError):
             filled_qty = qty
         if filled_qty <= 0:
-            print(f"      [strategy5] {symbol}: order response reports 0 filled quantity, skipping "
-                  f"TP/SL placement and not tracking a position. Raw: {resp['data']}")
+            # Expected sometimes now that entries are LIMIT orders resting at
+            # the current price rather than MARKET orders — a 0 here just
+            # means it hasn't filled yet (or filled after price moved off
+            # the signal candle's close), not necessarily an error.
+            print(f"      [strategy5] {symbol}: order response reports 0 filled quantity (LIMIT order may "
+                  f"still be resting), skipping TP/SL placement and not tracking a position this cycle. "
+                  f"Raw: {resp['data']}")
             continue
         if filled_qty != qty:
             print(f"      [strategy5] {symbol}: requested {qty}, filled {filled_qty} "
@@ -4143,7 +4147,7 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
 
         entry_msg = (
             f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 5 — RE] {side} {symbol}\n"
-            f"Entry: {entry_price} (market)  |  Qty: {qty}  |  Leverage: {leverage}x"
+            f"Entry: {entry_price} (limit)  |  Qty: {qty}  |  Leverage: {leverage}x"
             f"{f' ({STRATEGY5_LEVERAGE}x unavailable, capped down)' if leverage < STRATEGY5_LEVERAGE else ''}"
             f"{f' (symbol minimum forced leverage UP from {STRATEGY5_LEVERAGE}x)' if leverage > STRATEGY5_LEVERAGE else ''}\n"
             f"Signal: EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} crossover on "
@@ -4277,18 +4281,16 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({STRATEGY4_CAPITAL_INR:,} INR)"
     elif active_strategy == "5":
         # Strategy 5's minimum wallet requirement is set directly in USDT
-        # (STRATEGY5_CAPITAL_USDT), not converted from an INR figure — so it
-        # doesn't drift with the live USDT/INR rate. The gate itself also
-        # requires a small buffer above that figure (see
-        # STRATEGY5_BALANCE_BUFFER_PCT's docstring) so this pre-scan check
-        # and enter_trades_strategy5()'s own per-symbol check agree — a
-        # balance that's barely above the flat capital figure still risks a
-        # real "Insufficient balance" rejection from the exchange.
-        order_margin_usdt = STRATEGY5_CAPITAL_USDT
-        gate_required_usdt = order_margin_usdt * (1 + STRATEGY5_BALANCE_BUFFER_PCT / 100)
+        # (STRATEGY5_MIN_TRADE_USDT), not converted from an INR figure — so
+        # it doesn't drift with the live USDT/INR rate. This pre-scan check
+        # matches enter_trades_strategy5()'s own per-symbol check exactly —
+        # no extra buffer, since entries are LIMIT orders at the current
+        # price rather than MARKET orders.
+        order_margin_usdt = STRATEGY5_MIN_TRADE_USDT
+        gate_required_usdt = STRATEGY5_MIN_TRADE_USDT
         gate_capital_desc = (
-            f"{gate_required_usdt:.2f} USDT ({order_margin_usdt:.2f} USDT trade + "
-            f"{STRATEGY5_BALANCE_BUFFER_PCT:.0f}% buffer)"
+            f"{gate_required_usdt:.2f} USDT (trade sized {STRATEGY5_MIN_TRADE_USDT:.0f}-"
+            f"{STRATEGY5_MAX_TRADE_USDT:.0f} USDT off free balance)"
         )
     else:
         order_margin_usdt = CAPITAL_INR / usdt_inr_rate
