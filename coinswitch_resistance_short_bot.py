@@ -452,6 +452,12 @@ STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage defau
 # 75-76 USDT range.
 STRATEGY5_MIN_TRADE_USDT = float(os.environ.get("STRATEGY5_MIN_TRADE_USDT", "75"))
 STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "76"))
+# Reserved headroom, subtracted from the live balance BEFORE capping at
+# STRATEGY5_MAX_TRADE_USDT, so a trade sized off the full free balance
+# doesn't leave zero room for CoinSwitch's taker fee on entry (observed
+# live: a balance only just above the margin figure still got rejected as
+# "Insufficient balance" because the fee had nowhere left to come from).
+STRATEGY5_FEE_BUFFER_USDT = float(os.environ.get("STRATEGY5_FEE_BUFFER_USDT", "1.5"))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
@@ -4033,11 +4039,14 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         # Coarse check using the cycle-start balance snapshot, just to avoid
         # wasting a klines fetch when it's obviously not enough. The
         # authoritative check happens right before order placement below,
-        # against a freshly re-fetched balance.
-        if not DRY_RUN and available_balance_usdt < STRATEGY5_MIN_TRADE_USDT:
+        # against a freshly re-fetched balance. Requires the fee buffer on
+        # top of the trade minimum too, so this can't pass a balance that's
+        # only enough for the margin with nothing left for fees.
+        if not DRY_RUN and available_balance_usdt < STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT:
             print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
-                  f"{STRATEGY5_MIN_TRADE_USDT:.2f} USDT minimum needed for the next "
-                  f"{symbol} trade — skipping this symbol this cycle.")
+                  f"{STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT:.2f} USDT minimum needed "
+                  f"({STRATEGY5_MIN_TRADE_USDT:.0f} USDT trade + {STRATEGY5_FEE_BUFFER_USDT:.2f} USDT "
+                  f"fee buffer) for the next {symbol} trade — skipping this symbol this cycle.")
             continue
 
         try:
@@ -4089,14 +4098,15 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             except Exception as e:
                 print(f"      [strategy5] {symbol}: live balance re-check failed ({e}), falling back "
                       f"to the cycle-start snapshot ({available_balance_usdt:.2f} USDT).")
-            if available_balance_usdt < STRATEGY5_MIN_TRADE_USDT:
+            if available_balance_usdt < STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT:
                 print(f"      [strategy5] {symbol}: live balance {available_balance_usdt:.2f} USDT is "
-                      f"below the {STRATEGY5_MIN_TRADE_USDT:.2f} USDT minimum — skipping this trade "
+                      f"below the {STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT:.2f} USDT "
+                      f"minimum (trade + fee buffer) — skipping this trade "
                       f"(cycle-start snapshot said it was enough).")
                 continue
 
         order_margin_usdt = (
-            min(available_balance_usdt, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
+            min(available_balance_usdt - STRATEGY5_FEE_BUFFER_USDT, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
             else STRATEGY5_MAX_TRADE_USDT
         )
 
@@ -4302,14 +4312,16 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({STRATEGY4_CAPITAL_INR:,} INR)"
     elif active_strategy == "5":
         # Strategy 5's minimum wallet requirement is set directly in USDT
-        # (STRATEGY5_MIN_TRADE_USDT), not converted from an INR figure — so
-        # it doesn't drift with the live USDT/INR rate. This pre-scan check
-        # matches enter_trades_strategy5()'s own per-symbol check exactly.
+        # (STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT), not
+        # converted from an INR figure — so it doesn't drift with the live
+        # USDT/INR rate. This pre-scan check matches
+        # enter_trades_strategy5()'s own per-symbol check exactly.
         order_margin_usdt = STRATEGY5_MIN_TRADE_USDT
-        gate_required_usdt = STRATEGY5_MIN_TRADE_USDT
+        gate_required_usdt = STRATEGY5_MIN_TRADE_USDT + STRATEGY5_FEE_BUFFER_USDT
         gate_capital_desc = (
             f"{gate_required_usdt:.2f} USDT (trade sized {STRATEGY5_MIN_TRADE_USDT:.0f}-"
-            f"{STRATEGY5_MAX_TRADE_USDT:.0f} USDT off free balance)"
+            f"{STRATEGY5_MAX_TRADE_USDT:.0f} USDT + {STRATEGY5_FEE_BUFFER_USDT:.2f} USDT fee buffer, "
+            f"off free balance)"
         )
     else:
         order_margin_usdt = CAPITAL_INR / usdt_inr_rate
