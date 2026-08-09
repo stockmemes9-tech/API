@@ -458,7 +458,7 @@ STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage defau
 # wallet, capped at STRATEGY5_MAX_TRADE_USDT, so it naturally lands in the
 # 70-76 USDT range.
 STRATEGY5_MIN_TRADE_USDT = float(os.environ.get("STRATEGY5_MIN_TRADE_USDT", "70"))
-STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "76"))
+STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "70"))
 # Reserved headroom, subtracted from the live balance BEFORE capping at
 # STRATEGY5_MAX_TRADE_USDT, so a trade sized off the full free balance
 # doesn't leave zero room for CoinSwitch's taker fee on entry (observed
