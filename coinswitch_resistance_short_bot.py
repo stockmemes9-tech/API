@@ -409,7 +409,7 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # the symbol actually allows if that's not available (resolve_leverage(),
 # same as strategies 2/4). Capital: sized per-trade in the
 # STRATEGY5_MIN_TRADE_USDT-STRATEGY5_MAX_TRADE_USDT USDT range (default
-# 75-76 USDT) rather than an INR figure converted at the live rate — set
+# 70-76 USDT) rather than an INR figure converted at the live rate — set
 # directly in USDT since this strategy's wallet/trade-size requirement was
 # specified in USDT, not INR. Entries are placed as MARKET orders, filling
 # close to the latest closed candle's close (i.e. the current price).
@@ -449,8 +449,8 @@ STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage defau
 # wallet balance required before even attempting a trade is
 # STRATEGY5_MIN_TRADE_USDT. The actual trade size is whatever's free in the
 # wallet, capped at STRATEGY5_MAX_TRADE_USDT, so it naturally lands in the
-# 75-76 USDT range.
-STRATEGY5_MIN_TRADE_USDT = float(os.environ.get("STRATEGY5_MIN_TRADE_USDT", "75"))
+# 70-76 USDT range.
+STRATEGY5_MIN_TRADE_USDT = float(os.environ.get("STRATEGY5_MIN_TRADE_USDT", "70"))
 STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "76"))
 # Reserved headroom, subtracted from the live balance BEFORE capping at
 # STRATEGY5_MAX_TRADE_USDT, so a trade sized off the full free balance
