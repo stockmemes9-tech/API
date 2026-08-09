@@ -1758,8 +1758,41 @@ def recover_open_positions(instruments, daily_trade_tracker):
         print(f"  [state] restored {len(recovered)} simulated (DRY RUN) open short(s) "
               f"from saved state: {', '.join(recovered.keys())}")
 
-    symbols = list(instruments.keys())
-    print(f"Checking {len(symbols)} symbols on CoinSwitch for pre-existing open positions...")
+    symbols_to_check_desc_suffix = ""
+    active_strategy_for_recovery = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+    if active_strategy_for_recovery in ("4", "5"):
+        # Strategy 4/5 only ever open new trades on a small fixed symbol
+        # list (see enter_trades_strategy4/5()) — checking all ~670+
+        # CoinSwitch futures symbols one-by-one at the 3.1s/symbol pace
+        # below (CoinSwitch's Get Positions rate limit) can take ~35
+        # minutes on every single deploy for no benefit, since a position
+        # this bot itself would open can only ever land on one of these
+        # symbols. Still also check every symbol saved state remembers a
+        # REAL (non-simulated) position on, regardless of which strategy
+        # opened it or whether it's still in this strategy's own list —
+        # a position doesn't stop existing just because the active
+        # strategy changed since it was opened.
+        strategy_fixed_symbols = (
+            {STRATEGY4_SYMBOL} if active_strategy_for_recovery == "4" else set(STRATEGY5_SYMBOLS)
+        )
+        saved_real_symbols = {
+            s for s, pos in state_open_shorts.items() if not pos.get("simulated")
+        }
+        symbols = sorted(
+            (strategy_fixed_symbols | saved_real_symbols) & set(instruments.keys())
+        )
+        symbols_to_check_desc_suffix = (
+            f" (strategy {active_strategy_for_recovery}'s fixed symbol(s) plus any symbol with a "
+            f"saved real position — not the full {len(instruments)}-symbol market, since strategy "
+            f"{active_strategy_for_recovery} never opens trades outside its fixed list)"
+        )
+    else:
+        # Strategy 1/2/3 screen candidates from across the whole market (see
+        # run_once()), so a leftover real position genuinely could be on any
+        # symbol — the full scan is actually needed here.
+        symbols = list(instruments.keys())
+    print(f"Checking {len(symbols)} symbols on CoinSwitch for pre-existing open "
+          f"positions{symbols_to_check_desc_suffix}...")
     for i, symbol in enumerate(symbols):
         try:
             positions = get_positions(symbol)
