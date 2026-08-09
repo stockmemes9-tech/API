@@ -378,9 +378,9 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # backtest_strategy_ema9_ema21_cross.py script. Like strategy 4, this does
 # NOT run any market-wide screening — it only ever trades the fixed list of
 # symbols in STRATEGY5_SYMBOLS (default REUSDT,CCUSDT,RIFUSDT,
-# DEEPUSDT,CRVUSDT,ARBUSDT —
+# DEEPUSDT,CRVUSDT,ARBUSDT,TREEUSDT —
 # REUSDT matches the backtest script's own default; CCUSDT/
-# RIFUSDT/DEEPUSDT/CRVUSDT/ARBUSDT were added on top of it (SAHARAUSDT was
+# RIFUSDT/DEEPUSDT/CRVUSDT/ARBUSDT/TREEUSDT were added on top of it (SAHARAUSDT was
 # removed after repeated exchange-side "Insufficient balance" rejections
 # that didn't match its actual free wallet balance — see notes near
 # STRATEGY5_FEE_BUFFER_USDT). Each symbol in the list is evaluated
@@ -424,12 +424,12 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # (in live trading) not having enough free wallet balance for the margin.
 STRATEGY5_ENABLED = True
 # Comma-separated list of symbols this strategy trades, e.g.
-# "REUSDT,CCUSDT,RIFUSDT,DEEPUSDT,CRVUSDT,ARBUSDT". Override via the
+# "REUSDT,CCUSDT,RIFUSDT,DEEPUSDT,CRVUSDT,ARBUSDT,TREEUSDT". Override via the
 # STRATEGY5_SYMBOLS env var (still comma-separated). STRATEGY5_SYMBOL
 # (singular) is kept as a backward-compatible override for a single-symbol
 # deploy — if it's set and STRATEGY5_SYMBOLS isn't, it's used instead of the
 # default list.
-_STRATEGY5_SYMBOLS_DEFAULT = "REUSDT,CCUSDT,RIFUSDT,DEEPUSDT,CRVUSDT,ARBUSDT"
+_STRATEGY5_SYMBOLS_DEFAULT = "REUSDT,CCUSDT,RIFUSDT,DEEPUSDT,CRVUSDT,ARBUSDT,TREEUSDT"
 STRATEGY5_SYMBOLS = [
     s.strip().upper()
     for s in os.environ.get(
@@ -4004,7 +4004,7 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
     Only called when strategy 5 is the active strategy (see run_once()).
     Like strategy 4, this does NOT go through screen_candidates() at all — it
     only ever looks at the fixed symbols in STRATEGY5_SYMBOLS (default
-    REUSDT, CCUSDT, RIFUSDT, DEEPUSDT, CRVUSDT, ARBUSDT), evaluated
+    REUSDT, CCUSDT, RIFUSDT, DEEPUSDT, CRVUSDT, ARBUSDT, TREEUSDT), evaluated
     independently one at a time in the
     loop below.
 
