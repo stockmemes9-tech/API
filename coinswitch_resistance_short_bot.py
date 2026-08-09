@@ -4081,7 +4081,18 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             print(f"      [strategy5] {symbol}: this symbol's own minimum leverage ({leverage}x) is "
                   f"above {STRATEGY5_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
                   f"leverage than desired.")
-        set_leverage(symbol, leverage)
+        try:
+            set_leverage(symbol, leverage)
+        except Exception as e:
+            # If the exchange rejects/ignores this, the account may still be
+            # sitting at whatever leverage it had before — which can silently
+            # break the margin math below (notional / intended leverage) if
+            # the real effective leverage ends up lower. Log it loudly and
+            # keep going rather than abort the whole cycle; the sizing log
+            # line right below will show whether that's what happened.
+            print(f"      [strategy5] {symbol}: set_leverage({leverage}x) failed ({e}) — "
+                  f"the exchange may still be using a different leverage than intended, which can "
+                  f"cause an 'Insufficient balance' rejection even with a healthy free balance.")
 
         # Re-fetch the wallet balance right here, immediately before placing
         # the order — the cycle-start snapshot (available_balance_usdt) can
@@ -4109,6 +4120,21 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             min(available_balance_usdt - STRATEGY5_FEE_BUFFER_USDT, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
             else STRATEGY5_MAX_TRADE_USDT
         )
+
+        # Always log the exact sizing inputs right before the order goes
+        # out — margin, leverage, and resulting notional — so an
+        # "Insufficient balance" rejection despite a healthy free balance
+        # (as seen live on SAHARAUSDT) can be diagnosed from the logs
+        # instead of guessed at. In particular this makes it possible to
+        # tell whether the exchange is actually honoring
+        # STRATEGY5_LEVERAGE — if it silently caps leverage lower than what
+        # instrument.get("max_leverage") reports, the real required margin
+        # would be notional / actual_leverage, which can be far above what
+        # this bot thinks it's sending.
+        print(f"      [strategy5] {symbol}: sizing entry — margin {order_margin_usdt:.2f} USDT, "
+              f"leverage {leverage}x (instrument max_leverage reported: "
+              f"{instrument.get('max_leverage', 'unknown')}), notional "
+              f"{order_margin_usdt * leverage:.2f} USDT, free balance {available_balance_usdt:.2f} USDT")
 
         price_precision = int(instrument.get("price_precision", 4))
         entry_price = round(latest_close, price_precision)  # for sizing/TP/SL calc; MARKET order will fill close to this
