@@ -649,7 +649,14 @@ def send_telegram_message(text, reply_markup=None):
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            # requests doesn't raise on a non-2xx response unless you call
+            # raise_for_status() — without this check, a Telegram-side
+            # rejection (rate limit, bad chat id, message too long, etc.)
+            # was silently swallowed: no exception, no log, no alert ever
+            # delivered, even though the caller thought this "succeeded".
+            print(f"  [telegram] send failed: HTTP {r.status_code}, body: {r.text[:500]}")
     except Exception as e:
         print(f"  [telegram] failed to send alert: {e}")
 
