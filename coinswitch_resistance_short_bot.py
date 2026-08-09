@@ -4159,8 +4159,22 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
             print(f"  [refresh] failed to refresh market cap list / USDT-INR rate ({e}), "
                   f"keeping previous values for this cycle.")
 
-    # Fixed CAPITAL_INR margin per trade, converted to USDT at the live rate.
-    order_margin_usdt = CAPITAL_INR / usdt_inr_rate
+    # Which strategy is actually running — read this FIRST so the balance
+    # gate below can be sized off the RIGHT capital figure. Previously this
+    # gate always used the strategy 1-3 CAPITAL_INR (10,000 INR) even when
+    # strategy 4/5 (which use their own, smaller, per-strategy capital
+    # constants) was active, which could silently skip the ENTIRE scan cycle
+    # — before enter_trades_strategy4/5() ever ran their own, correct,
+    # balance check — whenever the wallet had enough for that strategy's
+    # actual trade size but not enough for the unrelated 10,000 INR figure.
+    active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+    if active_strategy == "4":
+        gate_capital_inr = STRATEGY4_CAPITAL_INR
+    elif active_strategy == "5":
+        gate_capital_inr = STRATEGY5_CAPITAL_INR
+    else:
+        gate_capital_inr = CAPITAL_INR
+    order_margin_usdt = gate_capital_inr / usdt_inr_rate
 
     # Check available balance (USDT + INR, combined at the live rate) BEFORE
     # doing any real work this cycle — including screening candidates. If
@@ -4179,15 +4193,14 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     if not DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"{order_margin_usdt:.2f} USDT ({gate_capital_inr:,} INR) needed for one trade — "
               f"not scanning for new trades this cycle. Existing open positions are unaffected.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
     elif DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR) needed for one trade — "
+              f"{order_margin_usdt:.2f} USDT ({gate_capital_inr:,} INR) needed for one trade — "
               f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
 
-    active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
     if active_strategy in ("1", "3"):
         candidates = screen_candidates(tickers, top_cap_symbols, usdt_inr_rate)
         filter_desc = "market-cap/drop/volume"
