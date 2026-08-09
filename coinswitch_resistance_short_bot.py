@@ -871,7 +871,33 @@ def get_positions(symbol, max_retries=3, retry_delay_seconds=2.0):
                 f"CoinSwitch /positions response for {symbol} has no 'data' field and isn't "
                 f"the known 'no open positions' message. HTTP {r.status_code}, raw body: {body}"
             )
-        return body["data"]
+        positions = body["data"]
+        # Defensive filter: confirmed live that CoinSwitch's ?symbol= filter
+        # can't be trusted — it was seen returning the account's ONE real
+        # open position (e.g. DEEPUSDT) for every symbol queried, regardless
+        # of the symbol param sent. Without this check, recover_open_positions()
+        # blindly took positions[0] as if it belonged to the queried symbol,
+        # fabricating a "position" on 9 different symbols all sharing the
+        # same entry price/qty as the one real position — untrackable and
+        # uncloseable since there was never a real position there to close.
+        # Only trust an entry whose OWN symbol field actually matches what
+        # was requested; entries missing a symbol field are kept as-is since
+        # there's nothing to cross-check them against.
+        filtered = []
+        mismatched = []
+        for p in positions:
+            p_symbol = p.get("symbol") or p.get("instrument") or p.get("instrument_name")
+            if p_symbol is None or str(p_symbol).upper() == symbol.upper():
+                filtered.append(p)
+            else:
+                mismatched.append(p_symbol)
+        if mismatched:
+            print(f"  [positions] {symbol}: API returned position(s) for a DIFFERENT symbol "
+                  f"({', '.join(str(m) for m in mismatched)}) — discarding them instead of "
+                  f"mistracking them as {symbol}'s position. This means CoinSwitch's symbol "
+                  f"filter isn't reliable; every get_positions() caller is now protected, but "
+                  f"consider filing this with CoinSwitch.")
+        return filtered
 
 
 def get_realized_pnl(symbol, from_time_ms):
