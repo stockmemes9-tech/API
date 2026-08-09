@@ -468,6 +468,17 @@ STRATEGY5_FEE_BUFFER_USDT = float(os.environ.get("STRATEGY5_FEE_BUFFER_USDT", "1
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
+# Quick-tap TP/SL percentages shown as inline buttons under each open
+# position in /status and the periodic status update (see
+# send_position_status_update()). These are flat price-move percentages —
+# for a USDT-margined linear perp, price-move % IS notional-value % (PnL =
+# price_move_pct * notional, independent of leverage), so "5%" here means a
+# take-profit/stop-loss 5% away from entry in price terms, same convention
+# STRATEGY5_TP_PCT/STRATEGY5_SL_PCT already use. Tapping one replaces any
+# existing TP/SL for that position via set_take_profit_manual()/
+# set_stop_loss_manual() — same code path as typing /tp or /sl manually.
+QUICK_TPSL_PCTS = [2, 5, 10]
+
 # symbol -> {"level": float, "candle_ts": <last confirmed candle's start_time>}
 # Only ever touched by the main scan-loop thread (enter_trades_strategy3()),
 # not by telegram_polling_loop, so unlike open_shorts/daily_trade_tracker it
@@ -2482,6 +2493,18 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
                     f"{unrealized:+.2f} USDT ({pct_move:+.2f}% price move)  "
                     f"entry {entry_price} -> now {current_price}{tp_sl_desc}"
                 )
+                # Quick-tap TP/SL buttons, flat % price-move off entry (see
+                # QUICK_TPSL_PCTS) — one row for TP, one for SL, both above
+                # the Close button below. Only shown when entry_price is
+                # known, since the target price is computed off it.
+                keyboard_rows.append([
+                    {"text": f"🎯 TP {pct}%", "callback_data": f"tppct:{symbol}:{pct}"}
+                    for pct in QUICK_TPSL_PCTS
+                ])
+                keyboard_rows.append([
+                    {"text": f"🛑 SL {pct}%", "callback_data": f"slpct:{symbol}:{pct}"}
+                    for pct in QUICK_TPSL_PCTS
+                ])
         # One button per position regardless of whether it priced this cycle —
         # you should always be able to close a stuck/unpriced position too.
         keyboard_rows.append([{"text": f"❌ Close {symbol}", "callback_data": f"close:{symbol}"}])
@@ -3232,6 +3255,51 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                 continue
 
             data = cq.get("data", "")
+            if data.startswith("tppct:") or data.startswith("slpct:"):
+                is_tp = data.startswith("tppct:")
+                prefix_len = len("tppct:") if is_tp else len("slpct:")
+                try:
+                    symbol, pct_str = data[prefix_len:].rsplit(":", 1)
+                    pct = float(pct_str)
+                except ValueError:
+                    answer_callback_query(cq.get("id", ""), "Bad button data.")
+                    continue
+
+                answer_callback_query(cq.get("id", ""), f"Setting {'TP' if is_tp else 'SL'} {pct}%...")
+                with state_lock:
+                    pos = open_shorts.get(symbol)
+                    if pos is None:
+                        send_telegram_message(f"⚠️ No open position found for {symbol} (already closed?).")
+                        continue
+                    entry_price = pos.get("entry_price")
+                    side = pos.get("side", "SHORT")
+                    if entry_price is None:
+                        send_telegram_message(
+                            f"⚠️ {symbol} has no known entry price right now — can't compute a "
+                            f"{pct}% target. Try /tp or /sl with an exact price instead."
+                        )
+                        continue
+                    # Flat price-move % off entry, same convention as
+                    # STRATEGY5_TP_PCT/SL_PCT — for a linear USDT-margined
+                    # perp this IS the notional-value % move (PnL =
+                    # price_move_pct * notional), independent of leverage.
+                    frac = pct / 100
+                    if side == "SHORT":
+                        target_price = entry_price * (1 - frac) if is_tp else entry_price * (1 + frac)
+                    else:
+                        target_price = entry_price * (1 + frac) if is_tp else entry_price * (1 - frac)
+                    print(f"  [telegram] quick {'TP' if is_tp else 'SL'} {pct}% tapped for {symbol} "
+                          f"-> target {target_price:.8g}")
+                    try:
+                        if is_tp:
+                            ok, msg = set_take_profit_manual(symbol, open_shorts, daily_trade_tracker, target_price)
+                        else:
+                            ok, msg = set_stop_loss_manual(symbol, open_shorts, daily_trade_tracker, target_price)
+                    except Exception as e:
+                        ok, msg = False, f"⚠️ Failed to set {'TP' if is_tp else 'SL'} for {symbol}: {e}"
+                    send_telegram_message(msg)
+                continue
+
             if not data.startswith("close:"):
                 answer_callback_query(cq.get("id", ""))
                 continue
