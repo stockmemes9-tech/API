@@ -2505,6 +2505,14 @@ def send_position_status_update(open_shorts, tickers, force_send=False):
                     {"text": f"🛑 SL {pct}%", "callback_data": f"slpct:{symbol}:{pct}"}
                     for pct in QUICK_TPSL_PCTS
                 ])
+                # Telegram buttons can't collect free-text input, so "Custom %"
+                # just prompts you to reply with the /tppct or /slpct text
+                # command (see apply_percent_tp_sl()), which accepts ANY
+                # percentage, not just the three quick presets above.
+                keyboard_rows.append([
+                    {"text": "✏️ Custom TP %", "callback_data": f"customhelp:tp:{symbol}"},
+                    {"text": "✏️ Custom SL %", "callback_data": f"customhelp:sl:{symbol}"},
+                ])
         # One button per position regardless of whether it priced this cycle —
         # you should always be able to close a stuck/unpriced position too.
         keyboard_rows.append([{"text": f"❌ Close {symbol}", "callback_data": f"close:{symbol}"}])
@@ -2810,6 +2818,43 @@ def set_stop_loss_manual(symbol, open_shorts, daily_trade_tracker, new_sl_price)
     return True, f"✅ Stop-loss for {symbol} set to {new_sl_price}."
 
 
+def apply_percent_tp_sl(symbol, pct, is_tp, open_shorts, daily_trade_tracker):
+    """Shared by both the quick-tap TP/SL buttons (see QUICK_TPSL_PCTS /
+    send_position_status_update()) and the /tppct, /slpct text commands —
+    converts a flat price-move % off entry into an actual price, then
+    delegates to set_take_profit_manual()/set_stop_loss_manual() to do the
+    real work (cancel + replace the resting order). `pct` can be any
+    positive number, not just the three quick-button presets, which is what
+    lets /tppct SYMBOL 3.5 (etc.) set a custom percentage the buttons don't
+    cover. Caller MUST already hold state_lock. Returns (ok: bool, message: str).
+
+    Same convention as STRATEGY5_TP_PCT/STRATEGY5_SL_PCT and QUICK_TPSL_PCTS:
+    for a USDT-margined linear perp, price-move % IS notional-value % (PnL =
+    price_move_pct * notional), independent of leverage."""
+    pos = open_shorts.get(symbol)
+    if pos is None:
+        return False, f"⚠️ No open position found for {symbol} (already closed?)."
+    if pct <= 0:
+        return False, f"⚠️ Percentage must be positive (got {pct})."
+
+    entry_price = pos.get("entry_price")
+    if entry_price is None:
+        return False, (
+            f"⚠️ {symbol} has no known entry price right now — can't compute a "
+            f"{pct}% target. Try /tp or /sl with an exact price instead."
+        )
+
+    side = pos.get("side", "SHORT")
+    frac = pct / 100
+    if side == "SHORT":
+        target_price = entry_price * (1 - frac) if is_tp else entry_price * (1 + frac)
+    else:
+        target_price = entry_price * (1 + frac) if is_tp else entry_price * (1 - frac)
+
+    handler = set_take_profit_manual if is_tp else set_stop_loss_manual
+    return handler(symbol, open_shorts, daily_trade_tracker, target_price)
+
+
 def send_help_message():
     """Handles the /help (and /commands) command — sends a plain-text list of
     every command this bot understands, so you don't have to remember them or
@@ -2827,6 +2872,8 @@ def send_help_message():
         "/debugvolume SYMBOL — raw volume-decline debug info for one symbol",
         "/tp SYMBOL PRICE — change the take-profit for an open position (0 removes it)",
         "/sl SYMBOL PRICE — set/change the stop-loss for an open position (0 removes it)",
+        "/tppct SYMBOL PERCENT — same as /tp but as a % price move off entry (e.g. /tppct dogeusdt 3.5)",
+        "/slpct SYMBOL PERCENT — same as /sl but as a % price move off entry",
         "/strategy — show which strategy is currently active for new trades",
         "/strategy1 — switch to Strategy 1 (resistance/RSI(77) LONG-only)",
         "/strategy2 — switch to Strategy 2 (RSI(14) 80/20 on 1h SHORT+LONG)",
@@ -3160,6 +3207,41 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                         except Exception as e:
                             print(f"  [telegram] /debugvolume failed unexpectedly: {e}")
                             send_telegram_message(f"⚠️ /debugvolume failed unexpectedly: {e}")
+                elif text.startswith("/tppct") or text.startswith("/slpct"):
+                    # Custom % version of /tp and /sl — takes a flat price-move
+                    # % off entry instead of an exact price, same convention as
+                    # the quick-tap TP/SL buttons (see QUICK_TPSL_PCTS) but not
+                    # limited to those three presets. Checked BEFORE the plain
+                    # /tp,/sl branch below since "/tppct".startswith("/tp") is
+                    # also True — order matters here.
+                    parts = text.split()
+                    is_tp = text.startswith("/tppct")
+                    cmd_name = "tppct" if is_tp else "slpct"
+                    if len(parts) < 3:
+                        send_telegram_message(
+                            f"Usage: /{cmd_name} SYMBOL PERCENT  (e.g. /{cmd_name} dogeusdt 3.5)\n"
+                            f"Sets the {'take-profit' if is_tp else 'stop-loss'} to a PERCENT price move "
+                            f"off entry (same convention as the TP/SL quick-tap buttons)."
+                        )
+                    else:
+                        symbol = parts[1].upper()
+                        try:
+                            pct = float(parts[2])
+                        except ValueError:
+                            send_telegram_message(f"⚠️ {parts[2]!r} doesn't look like a number.")
+                        else:
+                            print(f"  [telegram] /{cmd_name} {symbol} {pct}% requested")
+                            with state_lock:
+                                try:
+                                    ok, msg = apply_percent_tp_sl(
+                                        symbol, pct, is_tp, open_shorts, daily_trade_tracker
+                                    )
+                                    send_telegram_message(msg)
+                                    if not ok:
+                                        print(f"  [telegram] /{cmd_name} {symbol} rejected: {msg}")
+                                except Exception as e:
+                                    print(f"  [telegram] /{cmd_name} {symbol} failed unexpectedly: {e}")
+                                    send_telegram_message(f"⚠️ /{cmd_name} {symbol} failed unexpectedly: {e}")
                 elif text.startswith("/tp") or text.startswith("/sl"):
                     parts = text.split()
                     cmd_name = parts[0].lstrip("/")  # "tp" or "sl"
@@ -3181,6 +3263,11 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                                     handler = set_take_profit_manual if cmd_name == "tp" else set_stop_loss_manual
                                     ok, msg = handler(symbol, open_shorts, daily_trade_tracker, new_price)
                                     send_telegram_message(msg)
+                                    if not ok:
+                                        print(f"  [telegram] /{cmd_name} {symbol} rejected: {msg}")
+                                except Exception as e:
+                                    print(f"  [telegram] /{cmd_name} {symbol} failed unexpectedly: {e}")
+                                    send_telegram_message(f"⚠️ /{cmd_name} {symbol} failed unexpectedly: {e}")
                                     if not ok:
                                         print(f"  [telegram] /{cmd_name} {symbol} rejected: {msg}")
                                 except Exception as e:
@@ -3255,6 +3342,22 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
                 continue
 
             data = cq.get("data", "")
+            if data.startswith("customhelp:"):
+                try:
+                    _, kind, symbol = data.split(":", 2)
+                except ValueError:
+                    answer_callback_query(cq.get("id", ""), "Bad button data.")
+                    continue
+                is_tp = kind == "tp"
+                answer_callback_query(cq.get("id", ""))
+                send_telegram_message(
+                    f"Reply with /{'tppct' if is_tp else 'slpct'} {symbol} PERCENT to set a custom "
+                    f"{'take-profit' if is_tp else 'stop-loss'} — e.g. "
+                    f"/{'tppct' if is_tp else 'slpct'} {symbol} 3.5 for a 3.5% price move off entry.\n"
+                    f"(Or use /{'tp' if is_tp else 'sl'} {symbol} PRICE for an exact price instead of a %.)"
+                )
+                continue
+
             if data.startswith("tppct:") or data.startswith("slpct:"):
                 is_tp = data.startswith("tppct:")
                 prefix_len = len("tppct:") if is_tp else len("slpct:")
@@ -3267,34 +3370,8 @@ def telegram_polling_loop(open_shorts, daily_trade_tracker):
 
                 answer_callback_query(cq.get("id", ""), f"Setting {'TP' if is_tp else 'SL'} {pct}%...")
                 with state_lock:
-                    pos = open_shorts.get(symbol)
-                    if pos is None:
-                        send_telegram_message(f"⚠️ No open position found for {symbol} (already closed?).")
-                        continue
-                    entry_price = pos.get("entry_price")
-                    side = pos.get("side", "SHORT")
-                    if entry_price is None:
-                        send_telegram_message(
-                            f"⚠️ {symbol} has no known entry price right now — can't compute a "
-                            f"{pct}% target. Try /tp or /sl with an exact price instead."
-                        )
-                        continue
-                    # Flat price-move % off entry, same convention as
-                    # STRATEGY5_TP_PCT/SL_PCT — for a linear USDT-margined
-                    # perp this IS the notional-value % move (PnL =
-                    # price_move_pct * notional), independent of leverage.
-                    frac = pct / 100
-                    if side == "SHORT":
-                        target_price = entry_price * (1 - frac) if is_tp else entry_price * (1 + frac)
-                    else:
-                        target_price = entry_price * (1 + frac) if is_tp else entry_price * (1 - frac)
-                    print(f"  [telegram] quick {'TP' if is_tp else 'SL'} {pct}% tapped for {symbol} "
-                          f"-> target {target_price:.8g}")
                     try:
-                        if is_tp:
-                            ok, msg = set_take_profit_manual(symbol, open_shorts, daily_trade_tracker, target_price)
-                        else:
-                            ok, msg = set_stop_loss_manual(symbol, open_shorts, daily_trade_tracker, target_price)
+                        ok, msg = apply_percent_tp_sl(symbol, pct, is_tp, open_shorts, daily_trade_tracker)
                     except Exception as e:
                         ok, msg = False, f"⚠️ Failed to set {'TP' if is_tp else 'SL'} for {symbol}: {e}"
                     send_telegram_message(msg)
