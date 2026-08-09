@@ -1080,7 +1080,16 @@ def place_order(symbol, side, order_type, quantity, price=None,
             print(f"  [order] rate-limited (429) placing order for {symbol}, retrying in {wait:.1f}s...")
             time.sleep(wait)
             continue
-        r.raise_for_status()
+        if not r.ok:
+            # raise_for_status() alone drops the response body, which is
+            # where CoinSwitch actually explains *why* a 400 happened —
+            # surface it so the logs/Telegram error show the real reason
+            # (e.g. below-minimum notional, bad precision, invalid symbol)
+            # instead of a bare "400 Client Error: Bad Request for url: ...".
+            raise RuntimeError(
+                f"CoinSwitch place order failed for {symbol} ({side} {quantity}): "
+                f"HTTP {r.status_code}, body: {r.text}"
+            )
         return r.json()
 
 
