@@ -444,6 +444,17 @@ STRATEGY5_KLINE_INTERVAL = os.environ.get("STRATEGY5_KLINE_INTERVAL", "60").stri
 STRATEGY5_LOOKBACK_CANDLES = 150       # plenty of candles for a stable EMA21 seed
 STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage default
 STRATEGY5_CAPITAL_USDT = max(80, int(os.environ.get("STRATEGY5_CAPITAL_USDT", "80")))
+# Extra headroom required ON TOP OF STRATEGY5_CAPITAL_USDT before attempting
+# a trade — NOT part of the position size itself (compute_quantity() below
+# still sizes off STRATEGY5_CAPITAL_USDT exactly). This exists because entry
+# sizing uses the latest CLOSED 60m candle's price, which can be up to ~1h
+# stale by the time a MARKET order actually reaches CoinSwitch's matching
+# engine; on a volatile low-cap symbol that drift (plus taker fees) is
+# enough to turn a wallet balance that's only just above the flat capital
+# figure into a real "Insufficient balance" rejection from the exchange —
+# observed live with an 81.57 USDT balance against an 80 USDT requirement.
+# Default 5% -> requires 84 USDT free before even trying an 80 USDT trade.
+STRATEGY5_BALANCE_BUFFER_PCT = float(os.environ.get("STRATEGY5_BALANCE_BUFFER_PCT", "5"))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
@@ -4018,9 +4029,15 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             continue
 
         order_margin_usdt = STRATEGY5_CAPITAL_USDT
-        if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+        # Require a small buffer above the flat capital figure, not just
+        # >= it — see STRATEGY5_BALANCE_BUFFER_PCT's docstring above for why
+        # an exact-or-barely-above balance still risks a real "Insufficient
+        # balance" rejection from the exchange on a volatile symbol.
+        required_with_buffer = order_margin_usdt * (1 + STRATEGY5_BALANCE_BUFFER_PCT / 100)
+        if not DRY_RUN and available_balance_usdt < required_with_buffer:
             print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
-                  f"{order_margin_usdt:.2f} USDT needed for the next "
+                  f"{required_with_buffer:.2f} USDT needed ({order_margin_usdt:.2f} USDT trade + "
+                  f"{STRATEGY5_BALANCE_BUFFER_PCT:.0f}% buffer) for the next "
                   f"{symbol} trade — skipping this symbol this cycle.")
             continue
 
@@ -4256,15 +4273,26 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
     if active_strategy == "4":
         order_margin_usdt = STRATEGY4_CAPITAL_INR / usdt_inr_rate
+        gate_required_usdt = order_margin_usdt
         gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({STRATEGY4_CAPITAL_INR:,} INR)"
     elif active_strategy == "5":
         # Strategy 5's minimum wallet requirement is set directly in USDT
         # (STRATEGY5_CAPITAL_USDT), not converted from an INR figure — so it
-        # doesn't drift with the live USDT/INR rate.
+        # doesn't drift with the live USDT/INR rate. The gate itself also
+        # requires a small buffer above that figure (see
+        # STRATEGY5_BALANCE_BUFFER_PCT's docstring) so this pre-scan check
+        # and enter_trades_strategy5()'s own per-symbol check agree — a
+        # balance that's barely above the flat capital figure still risks a
+        # real "Insufficient balance" rejection from the exchange.
         order_margin_usdt = STRATEGY5_CAPITAL_USDT
-        gate_capital_desc = f"{order_margin_usdt:.2f} USDT"
+        gate_required_usdt = order_margin_usdt * (1 + STRATEGY5_BALANCE_BUFFER_PCT / 100)
+        gate_capital_desc = (
+            f"{gate_required_usdt:.2f} USDT ({order_margin_usdt:.2f} USDT trade + "
+            f"{STRATEGY5_BALANCE_BUFFER_PCT:.0f}% buffer)"
+        )
     else:
         order_margin_usdt = CAPITAL_INR / usdt_inr_rate
+        gate_required_usdt = order_margin_usdt
         gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR)"
 
     # Check available balance (USDT + INR, combined at the live rate) BEFORE
@@ -4282,12 +4310,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
         print(f"  [wallet] balance check failed ({e}), skipping this cycle to be safe.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
 
-    if not DRY_RUN and available_balance_usdt < order_margin_usdt:
+    if not DRY_RUN and available_balance_usdt < gate_required_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
               f"{gate_capital_desc} needed for one trade — "
               f"not scanning for new trades this cycle. Existing open positions are unaffected.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
-    elif DRY_RUN and available_balance_usdt < order_margin_usdt:
+    elif DRY_RUN and available_balance_usdt < gate_required_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
               f"{gate_capital_desc} needed for one trade — "
               f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
