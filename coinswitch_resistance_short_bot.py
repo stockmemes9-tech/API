@@ -377,10 +377,11 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # A fifth, completely separate strategy — ported live from the standalone
 # backtest_strategy_ema9_ema21_cross.py script. Like strategy 4, this does
 # NOT run any market-wide screening — it only ever trades the fixed list of
-# symbols in STRATEGY5_SYMBOLS (default REUSDT,SAHARAUSDT,CCUSDT — REUSDT
-# matches the backtest script's own default; SAHARAUSDT/CCUSDT were added
-# on top of it). Each symbol in the list is evaluated independently every
-# cycle and can have its own open position at the same time.
+# symbols in STRATEGY5_SYMBOLS (default REUSDT,SAHARAUSDT,CCUSDT,RIFUSDT —
+# REUSDT matches the backtest script's own default; SAHARAUSDT/CCUSDT/
+# RIFUSDT were added on top of it). Each symbol in the list is evaluated
+# independently every cycle and can have its own open position at the same
+# time.
 #
 # Rule, evaluated on the latest CLOSED candle only (see
 # compute_ema_cross_signal()):
@@ -415,11 +416,11 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 # (in live trading) not having enough free wallet balance for the margin.
 STRATEGY5_ENABLED = True
 # Comma-separated list of symbols this strategy trades, e.g.
-# "REUSDT,SAHARAUSDT,CCUSDT". Override via the STRATEGY5_SYMBOLS env var
-# (still comma-separated). STRATEGY5_SYMBOL (singular) is kept as a
+# "REUSDT,SAHARAUSDT,CCUSDT,RIFUSDT". Override via the STRATEGY5_SYMBOLS env
+# var (still comma-separated). STRATEGY5_SYMBOL (singular) is kept as a
 # backward-compatible override for a single-symbol deploy — if it's set and
 # STRATEGY5_SYMBOLS isn't, it's used instead of the default list.
-_STRATEGY5_SYMBOLS_DEFAULT = "REUSDT,SAHARAUSDT,CCUSDT"
+_STRATEGY5_SYMBOLS_DEFAULT = "REUSDT,SAHARAUSDT,CCUSDT,RIFUSDT"
 STRATEGY5_SYMBOLS = [
     s.strip().upper()
     for s in os.environ.get(
@@ -1636,6 +1637,27 @@ def save_state(open_shorts, daily_trade_tracker):
         print(f"  [state] failed to save state file: {e}")
 
 
+def restore_active_strategy_from_state():
+    """Peeks at the saved state file for just the active-strategy field and,
+    if present and valid, applies it to strategy_state immediately. This is
+    called at the very top of main() — BEFORE the top-200 CoinGecko
+    market-cap scan — specifically so that scan can be skipped on strategy
+    4/5 deploys. It duplicates the same field load_state()/
+    recover_open_positions() will read again later for open_shorts/
+    daily_trade_tracker restoration; that second read is harmless and kept
+    as-is so nothing else about startup ordering has to change. Never raises
+    — a missing/corrupt file here just leaves strategy_state at its env-var
+    default, exactly like load_state()'s existing fallback behavior."""
+    try:
+        with open(STATE_FILE_PATH, "r") as f:
+            payload = json.load(f)
+        saved_strategy = payload.get("active_strategy")
+        if saved_strategy in ("1", "2", "3", "4", "5"):
+            strategy_state["active"] = saved_strategy
+    except Exception:
+        pass  # fall back to the env-var default; load_state() will retry properly later
+
+
 def load_state():
     """Returns (open_shorts, daily_trade_tracker) loaded from the local state
     file, or (None, None) if it doesn't exist or can't be parsed. A missing
@@ -1646,7 +1668,7 @@ def load_state():
         with open(STATE_FILE_PATH, "r") as f:
             payload = json.load(f)
         saved_strategy = payload.get("active_strategy")
-        if saved_strategy in ("1", "2", "3"):
+        if saved_strategy in ("1", "2", "3", "4", "5"):
             strategy_state["active"] = saved_strategy
             print(f"  [state] restored active strategy from saved state: strategy {saved_strategy}")
         saved_pending = payload.get("strategy3_pending_confirmation")
@@ -3919,7 +3941,7 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
     Only called when strategy 5 is the active strategy (see run_once()).
     Like strategy 4, this does NOT go through screen_candidates() at all — it
     only ever looks at the fixed symbols in STRATEGY5_SYMBOLS (default
-    REUSDT, SAHARAUSDT, CCUSDT), evaluated independently one at a time in the
+    REUSDT, SAHARAUSDT, CCUSDT, RIFUSDT), evaluated independently one at a time in the
     loop below.
 
     Rule, evaluated on the latest CLOSED candle only (see
@@ -4145,13 +4167,33 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # screened against the wrong exclusion list, and the margin-per-trade
     # sizing (CAPITAL_INR / usdt_inr_rate) would silently drift from its
     # intended INR value as the real USDT/INR rate moves.
-    if last_market_refresh_date != today:
+    # Which strategy is active governs whether the top-200 scan is even
+    # needed — read it here too (not just after screening below) since
+    # strategy 4/5 never consult top_cap_symbols (see the "No market-wide
+    # screening at all" branches further down).
+    refresh_active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+    needs_market_cap_scan = refresh_active_strategy in ("1", "2", "3")
+    # Besides the once-a-day refresh, also fire immediately (regardless of
+    # last_market_refresh_date) the moment a live /strategy1, /strategy2, or
+    # /strategy3 Telegram switch moves INTO a scan-needing strategy while
+    # top_cap_symbols is still empty — e.g. because the process started on
+    # strategy 4/5 and skipped the scan at startup/last refresh. Without
+    # this, switching strategies mid-run could screen candidates against an
+    # empty exclusion set until the next calendar-day rollover.
+    stale_scan_needed = needs_market_cap_scan and not top_cap_symbols
+    if last_market_refresh_date != today or stale_scan_needed:
         try:
-            top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
+            if needs_market_cap_scan:
+                top_cap_symbols = get_top_market_cap_symbols(TOP_N_MARKET_CAP_EXCLUDE)
             usdt_inr_rate = get_usdt_inr_rate()
             last_market_refresh_date = today
-            print(f"  [refresh] top-200 market cap list and USDT/INR rate refreshed for {today} "
-                  f"(USDT/INR ~= {usdt_inr_rate}).")
+            if needs_market_cap_scan:
+                print(f"  [refresh] top-200 market cap list and USDT/INR rate refreshed for {today} "
+                      f"(USDT/INR ~= {usdt_inr_rate}).")
+            else:
+                print(f"  [refresh] strategy {refresh_active_strategy} active — skipped the top-200 "
+                      f"market cap scan (not used by this strategy) and refreshed USDT/INR rate only "
+                      f"for {today} (USDT/INR ~= {usdt_inr_rate}).")
         except requests.HTTPError as e:
             # Don't let a transient CoinGecko blip abort this cycle's scan —
             # keep using the previous values and try the refresh again next
@@ -4298,10 +4340,27 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
 
 def main():
-    print("Fetching top-200 market cap list and USDT/INR rate from CoinGecko...")
-    top_cap_symbols = fetch_with_retry(
-        get_top_market_cap_symbols, TOP_N_MARKET_CAP_EXCLUDE, description="top-200 market cap list"
-    )
+    # Restore whichever strategy was active before this deploy/restart FIRST
+    # — before the top-200 CoinGecko market-cap scan below — so that scan
+    # can be skipped entirely when strategy 4/5 (which never use
+    # top_cap_symbols; see run_once()'s "No market-wide screening at all"
+    # branches) is what's actually running. Without this, every redeploy
+    # scanned the full top-200 market unconditionally, since strategy_state
+    # still held only its ACTIVE_STRATEGY env-var default at this point.
+    restore_active_strategy_from_state()
+    active_strategy_at_startup = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
+
+    if active_strategy_at_startup in ("1", "2", "3"):
+        print("Fetching top-200 market cap list and USDT/INR rate from CoinGecko...")
+        top_cap_symbols = fetch_with_retry(
+            get_top_market_cap_symbols, TOP_N_MARKET_CAP_EXCLUDE, description="top-200 market cap list"
+        )
+    else:
+        # Strategy 4/5 trade a fixed symbol list and never consult
+        # top_cap_symbols — skip the full market scan on this deploy.
+        print(f"Strategy {active_strategy_at_startup} active — skipping the top-200 market cap "
+              f"scan (not used by this strategy) and fetching USDT/INR rate only...")
+        top_cap_symbols = set()
     usdt_inr_rate = fetch_with_retry(get_usdt_inr_rate, description="USDT/INR rate")
     # Seeded to today (IST) since we just fetched fresh values above — this
     # stops run_once()'s daily refresh check (bug #6 fix) from immediately
