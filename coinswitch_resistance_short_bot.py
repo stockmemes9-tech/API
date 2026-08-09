@@ -407,8 +407,10 @@ STRATEGY4_TP_PRICE_MOVE_PCT = 0.3      # flat price-move %, not a %-on-capital f
 #
 # Leverage: fixed at STRATEGY5_LEVERAGE, falling back to the highest leverage
 # the symbol actually allows if that's not available (resolve_leverage(),
-# same as strategies 2/4). Capital: STRATEGY5_CAPITAL_INR, floored at 8,000
-# INR (lower than strategy 4's 10,000 floor).
+# same as strategies 2/4). Capital: STRATEGY5_CAPITAL_USDT, a flat USDT
+# margin figure (default/floor 80 USDT) rather than an INR figure converted
+# at the live rate — set directly in USDT since this strategy's minimum
+# wallet requirement was specified in USDT, not INR.
 #
 # Deliberately exempt from the shared ENTRY_COOLDOWN_HOURS/LOSS_COOLDOWN_HOURS
 # re-entry cooldowns and MAX_TRADES_PER_DAY cap, same reasoning as strategy 4
@@ -441,7 +443,7 @@ STRATEGY5_EMA_SLOW = 21
 STRATEGY5_KLINE_INTERVAL = os.environ.get("STRATEGY5_KLINE_INTERVAL", "60").strip()
 STRATEGY5_LOOKBACK_CANDLES = 150       # plenty of candles for a stable EMA21 seed
 STRATEGY5_LEVERAGE = 10                # matches the backtest's --leverage default
-STRATEGY5_CAPITAL_INR = max(8_000, int(os.environ.get("STRATEGY5_CAPITAL_INR", "8000")))
+STRATEGY5_CAPITAL_USDT = max(80, int(os.environ.get("STRATEGY5_CAPITAL_USDT", "80")))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 
@@ -4006,10 +4008,10 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             # again. Move on and check the next symbol in the list.
             continue
 
-        order_margin_usdt = STRATEGY5_CAPITAL_INR / usdt_inr_rate
+        order_margin_usdt = STRATEGY5_CAPITAL_USDT
         if not DRY_RUN and available_balance_usdt < order_margin_usdt:
             print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
-                  f"{order_margin_usdt:.2f} USDT ({STRATEGY5_CAPITAL_INR:,} INR) needed for the next "
+                  f"{order_margin_usdt:.2f} USDT needed for the next "
                   f"{symbol} trade — skipping this symbol this cycle.")
             continue
 
@@ -4244,12 +4246,17 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     # actual trade size but not enough for the unrelated 10,000 INR figure.
     active_strategy = strategy_state.get("active", ACTIVE_STRATEGY_DEFAULT)
     if active_strategy == "4":
-        gate_capital_inr = STRATEGY4_CAPITAL_INR
+        order_margin_usdt = STRATEGY4_CAPITAL_INR / usdt_inr_rate
+        gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({STRATEGY4_CAPITAL_INR:,} INR)"
     elif active_strategy == "5":
-        gate_capital_inr = STRATEGY5_CAPITAL_INR
+        # Strategy 5's minimum wallet requirement is set directly in USDT
+        # (STRATEGY5_CAPITAL_USDT), not converted from an INR figure — so it
+        # doesn't drift with the live USDT/INR rate.
+        order_margin_usdt = STRATEGY5_CAPITAL_USDT
+        gate_capital_desc = f"{order_margin_usdt:.2f} USDT"
     else:
-        gate_capital_inr = CAPITAL_INR
-    order_margin_usdt = gate_capital_inr / usdt_inr_rate
+        order_margin_usdt = CAPITAL_INR / usdt_inr_rate
+        gate_capital_desc = f"{order_margin_usdt:.2f} USDT ({CAPITAL_INR:,} INR)"
 
     # Check available balance (USDT + INR, combined at the live rate) BEFORE
     # doing any real work this cycle — including screening candidates. If
@@ -4268,12 +4275,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
 
     if not DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({gate_capital_inr:,} INR) needed for one trade — "
+              f"{gate_capital_desc} needed for one trade — "
               f"not scanning for new trades this cycle. Existing open positions are unaffected.")
         return top_cap_symbols, usdt_inr_rate, last_market_refresh_date, last_status_update_ms
     elif DRY_RUN and available_balance_usdt < order_margin_usdt:
         print(f"  [wallet] available balance {available_balance_usdt:.2f} USDT is below the "
-              f"{order_margin_usdt:.2f} USDT ({gate_capital_inr:,} INR) needed for one trade — "
+              f"{gate_capital_desc} needed for one trade — "
               f"continuing to scan anyway since DRY_RUN is on (no real orders will be placed).")
 
     if active_strategy in ("1", "3"):
