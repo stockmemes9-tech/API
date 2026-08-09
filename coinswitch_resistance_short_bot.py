@@ -2612,6 +2612,7 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
     entry_price = pos.get("entry_price")
     side = pos.get("side", "SHORT")
     close_side = "BUY" if side == "SHORT" else "SELL"  # closing a SHORT buys it back, closing a LONG sells it
+    pnl_is_estimate = False  # set True below if get_realized_pnl() came back empty and we had to fall back
 
     if is_simulated:
         # Nothing real was ever placed on the exchange, so there's nothing to
@@ -2647,11 +2648,43 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
         # via the next scan cycle — here we do it inline since this needs to
         # respond right away.
         time.sleep(2)
+        pnl_is_estimate = False
         try:
             pnl = get_realized_pnl(symbol, pos["opened_at_ms"])
+            if pnl == 0.0:
+                # A real fill netting to EXACTLY $0.00 is possible but rare —
+                # far more likely CoinSwitch's P&L transaction for this fill
+                # hadn't posted yet 2s after the close order, or (same
+                # unverified-field-name caveat as get_positions()) the
+                # 'amount'/'type' fields don't match what get_realized_pnl()
+                # expects and every entry silently got skipped/filtered to
+                # nothing. One retry after a longer wait, then fall back to
+                # a price-based estimate rather than reporting a possibly-
+                # fictitious "+0.00 USDT" — seen live on a DEEPUSDT close
+                # that the wallet balance confirmed was actually profitable.
+                time.sleep(3)
+                pnl = get_realized_pnl(symbol, pos["opened_at_ms"])
         except Exception as e:
-            print(f"  [manual close] {symbol}: P&L lookup failed ({e}), closing with unknown P&L.")
+            print(f"  [manual close] {symbol}: P&L lookup failed ({e}), will estimate from price instead.")
             pnl = 0.0
+
+        if pnl == 0.0:
+            last_price = None
+            try:
+                tickers = get_all_tickers()
+                t = tickers.get(symbol)
+                if t is not None:
+                    last_price = float(t["last_price"])
+            except Exception as e:
+                print(f"  [manual close] {symbol}: couldn't fetch price for P&L estimate fallback ({e}).")
+            if entry_price is not None and last_price is not None and qty is not None:
+                pnl = (
+                    (entry_price - last_price) * qty if side == "SHORT"
+                    else (last_price - entry_price) * qty
+                )
+                pnl_is_estimate = True
+                print(f"  [manual close] {symbol}: get_realized_pnl() returned 0.00 — "
+                      f"falling back to price-based estimate {pnl:+.2f} USDT (fees excluded).")
 
     del open_shorts[symbol]
     daily_trade_tracker["realized_pnl_usdt"] += pnl
@@ -2666,6 +2699,7 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
 
     send_telegram_message(
         f"✅ {'[DRY RUN] ' if is_simulated else ''}{symbol} manually closed. P&L: {pnl:+.2f} USDT"
+        f"{' (estimated, fees excluded — CoinSwitch P&L data unavailable)' if pnl_is_estimate else ''}"
     )
 
 
