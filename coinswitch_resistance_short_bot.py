@@ -4017,8 +4017,13 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
     LOSS_COOLDOWN_HOURS re-entry cooldowns and the MAX_TRADES_PER_DAY cap —
     the only real gate per-symbol is already having an open position on that
     symbol, or (in live trading) not having enough free wallet balance left
-    for the next trade's margin. Returns the (possibly decremented)
-    available_balance_usdt, same contract as enter_trades_strategy1/2/3/4."""
+    for the next trade's margin — checked twice: once cheaply against the
+    cycle-start snapshot before spending a klines fetch, then again against
+    a freshly re-fetched live balance immediately before the order is
+    placed, so a balance that changed (or was already stale) mid-cycle
+    can't slip through and hit an exchange-side "Insufficient balance"
+    rejection. Returns the (possibly decremented) available_balance_usdt,
+    same contract as enter_trades_strategy1/2/3/4."""
     for symbol in STRATEGY5_SYMBOLS:
         if symbol in open_shorts:
             # Already in a position on this symbol — it closes via its
@@ -4027,18 +4032,15 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             # again. Move on and check the next symbol in the list.
             continue
 
-        # Minimum wallet balance required before even attempting a trade —
-        # the trade itself is then sized off whatever's actually free, capped
-        # at STRATEGY5_MAX_TRADE_USDT, so it lands in the 77-80 USDT range.
+        # Coarse check using the cycle-start balance snapshot, just to avoid
+        # wasting a klines fetch when it's obviously not enough. The
+        # authoritative check happens right before order placement below,
+        # against a freshly re-fetched balance.
         if not DRY_RUN and available_balance_usdt < STRATEGY5_MIN_TRADE_USDT:
             print(f"  [strategy5] available balance {available_balance_usdt:.2f} USDT is below the "
                   f"{STRATEGY5_MIN_TRADE_USDT:.2f} USDT minimum needed for the next "
                   f"{symbol} trade — skipping this symbol this cycle.")
             continue
-        order_margin_usdt = (
-            min(available_balance_usdt, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
-            else STRATEGY5_MAX_TRADE_USDT
-        )
 
         try:
             candles = get_klines(symbol, interval=STRATEGY5_KLINE_INTERVAL, limit=STRATEGY5_LOOKBACK_CANDLES)
@@ -4073,6 +4075,32 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                   f"above {STRATEGY5_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
                   f"leverage than desired.")
         set_leverage(symbol, leverage)
+
+        # Re-fetch the wallet balance right here, immediately before placing
+        # the order — the cycle-start snapshot (available_balance_usdt) can
+        # be stale by the time we get this far (klines fetch, EMA calc,
+        # leverage resolution, and any earlier symbols in this same loop
+        # that already spent margin all take time/money). This is exactly
+        # what caused a live "Insufficient balance" rejection despite the
+        # cycle-start snapshot showing enough. Falls back to the
+        # cycle-start value if the re-fetch itself fails, rather than
+        # aborting the whole entry over a transient balance-check error.
+        if not DRY_RUN:
+            try:
+                available_balance_usdt = get_wallet_balance(usdt_inr_rate)["total_usdt"]
+            except Exception as e:
+                print(f"      [strategy5] {symbol}: live balance re-check failed ({e}), falling back "
+                      f"to the cycle-start snapshot ({available_balance_usdt:.2f} USDT).")
+            if available_balance_usdt < STRATEGY5_MIN_TRADE_USDT:
+                print(f"      [strategy5] {symbol}: live balance {available_balance_usdt:.2f} USDT is "
+                      f"below the {STRATEGY5_MIN_TRADE_USDT:.2f} USDT minimum — skipping this trade "
+                      f"(cycle-start snapshot said it was enough).")
+                continue
+
+        order_margin_usdt = (
+            min(available_balance_usdt, STRATEGY5_MAX_TRADE_USDT) if not DRY_RUN
+            else STRATEGY5_MAX_TRADE_USDT
+        )
 
         price_precision = int(instrument.get("price_precision", 4))
         entry_price = round(latest_close, price_precision)  # LIMIT order resting at the current price
