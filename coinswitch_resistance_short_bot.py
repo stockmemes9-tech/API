@@ -464,7 +464,7 @@ STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "70"
 # doesn't leave zero room for CoinSwitch's taker fee on entry (observed
 # live: a balance only just above the margin figure still got rejected as
 # "Insufficient balance" because the fee had nowhere left to come from).
-STRATEGY5_FEE_BUFFER_USDT = float(os.environ.get("STRATEGY5_FEE_BUFFER_USDT", "1.5"))
+STRATEGY5_FEE_BUFFER_USDT = float(os.environ.get("STRATEGY5_FEE_BUFFER_USDT", "3.5"))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
 # Re-entry cooldown, specific to strategy 5: after a symbol's position closes
