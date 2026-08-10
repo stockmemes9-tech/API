@@ -2272,6 +2272,25 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
         record_recent_close(symbol, daily_trade_tracker, int(time.time() * 1000))
         record_trade_close(symbol, pos, pnl, reason)
         print(f"  [reconcile] {symbol}: position closed. P&L {pnl:+.2f} USDT.")
+        if reason == "exchange_closed" and not pos.get("simulated", DRY_RUN):
+            # CORE BUG FIX (same issue as close_position_manual()): this
+            # branch fires whenever get_positions() finds the symbol flat
+            # again, which happens whether the TP filled, the SL filled, OR
+            # the position was closed some other way entirely (manually in
+            # the CoinSwitch app, liquidated, etc) — reconcile_open_shorts()
+            # doesn't know which. Either way, whichever of TP/SL DIDN'T
+            # cause the close is left resting on the exchange with nothing
+            # to protect anymore. Cancel both defensively; cancel_order()
+            # already treats "already gone" (404, e.g. the one that DID
+            # trigger) as a safe no-op, so this can't fail on the
+            # already-filled order.
+            for order_id in (pos.get("tp_order_id"), pos.get("sl_order_id")):
+                if order_id:
+                    try:
+                        cancel_order(symbol, order_id)
+                    except Exception as e:
+                        print(f"  [reconcile] {symbol}: failed to cancel leftover order {order_id} "
+                              f"({e}) — it may still be resting on the exchange, check manually.")
         send_telegram_message(
             f"{'[DRY RUN] ' if DRY_RUN else ''}{symbol} position closed. P&L: {pnl:+.2f} USDT"
         )
@@ -2785,6 +2804,28 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
                 pnl_is_estimate = True
                 print(f"  [manual close] {symbol}: get_realized_pnl() returned 0.00 — "
                       f"falling back to price-based estimate {pnl:+.2f} USDT (fees excluded).")
+
+        # CORE BUG FIX: the TP and SL orders placed at entry are two
+        # independent resting orders on the exchange, not linked to each
+        # other. Closing the position here (via a fresh reduce_only MARKET
+        # order) does NOT automatically remove whichever of the two didn't
+        # trigger — it stays resting on CoinSwitch. If price later swings
+        # back across that stale trigger, there's a real risk it fires
+        # anyway (reduce_only enforcement on a STOP_MARKET trigger isn't
+        # something to bet the account on) and opens a brand-new position
+        # this bot has zero record of — untracked, unprotected, and
+        # invisible to /status, silently costing margin and fees with no
+        # explanation. Best-effort, never blocks the close that already
+        # happened: cancel_order() already treats "already gone" (404) as
+        # success, so this is a safe no-op if the order already
+        # filled/expired/was the one that triggered this close.
+        for order_id in (pos.get("tp_order_id"), pos.get("sl_order_id")):
+            if order_id:
+                try:
+                    cancel_order(symbol, order_id)
+                except Exception as e:
+                    print(f"  [manual close] {symbol}: failed to cancel leftover order {order_id} "
+                          f"({e}) — it may still be resting on the exchange, check manually.")
 
     del open_shorts[symbol]
     daily_trade_tracker["realized_pnl_usdt"] += pnl
