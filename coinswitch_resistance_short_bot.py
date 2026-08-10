@@ -467,6 +467,17 @@ STRATEGY5_MAX_TRADE_USDT = float(os.environ.get("STRATEGY5_MAX_TRADE_USDT", "70"
 STRATEGY5_FEE_BUFFER_USDT = float(os.environ.get("STRATEGY5_FEE_BUFFER_USDT", "1.5"))
 STRATEGY5_TP_PCT = 5.0                 # flat price-move %, matches backtest --tp-pct default
 STRATEGY5_SL_PCT = 5.0                 # flat price-move %, matches backtest --sl-pct default (0 disables)
+# Re-entry cooldown, specific to strategy 5: after a symbol's position closes
+# (TP, SL, or manual — any reason), that symbol is skipped for this many
+# hours from the close time, even if a fresh EMA9/EMA21 crossover fires on
+# it in the meantime. Unlike ENTRY_COOLDOWN_HOURS/LOSS_COOLDOWN_HOURS (which
+# strategy 5 is otherwise exempt from — see enter_trades_strategy5()'s
+# docstring), this one is strategy-5-only and applies regardless of whether
+# the trade closed as a win or a loss. Keyed off
+# daily_trade_tracker["recent_closes"] (symbol -> closed_at_ms), stamped by
+# record_recent_close() at every close path.
+STRATEGY5_REENTRY_COOLDOWN_HOURS = float(os.environ.get("STRATEGY5_REENTRY_COOLDOWN_HOURS", "1"))
+STRATEGY5_REENTRY_COOLDOWN_MS = int(STRATEGY5_REENTRY_COOLDOWN_HOURS * 60 * 60 * 1000)
 
 # Quick-tap TP/SL percentages shown as inline buttons under each open
 # position in /status and the periodic status update (see
@@ -1800,11 +1811,13 @@ def recover_open_positions(instruments, daily_trade_tracker):
         # reset just because the date ticked over).
         daily_trade_tracker["recent_entries"] = state_daily_tracker.get("recent_entries") or {}
         daily_trade_tracker["recent_losses"] = state_daily_tracker.get("recent_losses") or {}
+        daily_trade_tracker["recent_closes"] = state_daily_tracker.get("recent_closes") or {}
         print(f"  [state] saved state is from a previous day "
               f"({state_daily_tracker.get('date')}), not restoring today's counters "
-              f"(re-entry and loss cooldown timestamps were still restored).")
+              f"(re-entry, loss cooldown, and strategy-5 close cooldown timestamps were still restored).")
     daily_trade_tracker.setdefault("recent_entries", {})
     daily_trade_tracker.setdefault("recent_losses", {})
+    daily_trade_tracker.setdefault("recent_closes", {})
 
     # Simulated (DRY_RUN) shorts never touched the real exchange, so there's
     # nothing to verify them against — the saved state IS the only record of
@@ -2041,6 +2054,17 @@ def record_loss_cooldown(symbol, pnl, daily_trade_tracker, closed_at_ms):
         daily_trade_tracker.setdefault("recent_losses", {})[symbol] = closed_at_ms
 
 
+def record_recent_close(symbol, daily_trade_tracker, closed_at_ms):
+    """Stamps symbol -> closed_at_ms in daily_trade_tracker["recent_closes"]
+    on EVERY close, win or loss alike — used by strategy 5's own
+    STRATEGY5_REENTRY_COOLDOWN_HOURS gate (see enter_trades_strategy5()) to
+    stop it from re-entering the same symbol within an hour of that symbol's
+    last close. Unlike record_loss_cooldown(), this doesn't check pnl at
+    all. Call this from every close path alongside record_loss_cooldown()
+    and record_trade_close()."""
+    daily_trade_tracker.setdefault("recent_closes", {})[symbol] = closed_at_ms
+
+
 def record_trade_close(symbol, pos, pnl, reason):
     """Appends one row to the trade-history CSV for every position that
     closes, however it closed (take-profit, manual Telegram button, or
@@ -2171,6 +2195,7 @@ def reconcile_open_shorts(open_shorts, tickers, daily_trade_tracker):
         else:
             daily_trade_tracker["losses"] += 1
         record_loss_cooldown(symbol, pnl, daily_trade_tracker, int(time.time() * 1000))
+        record_recent_close(symbol, daily_trade_tracker, int(time.time() * 1000))
         record_trade_close(symbol, pos, pnl, reason)
         print(f"  [reconcile] {symbol}: position closed. P&L {pnl:+.2f} USDT.")
         send_telegram_message(
@@ -2285,6 +2310,7 @@ def check_strategy4_signal_exits(open_shorts, daily_trade_tracker):
     else:
         daily_trade_tracker["losses"] += 1
     record_loss_cooldown(STRATEGY4_SYMBOL, pnl, daily_trade_tracker, int(time.time() * 1000))
+    record_recent_close(STRATEGY4_SYMBOL, daily_trade_tracker, int(time.time() * 1000))
     record_trade_close(STRATEGY4_SYMBOL, pos, pnl, "strategy4_ema9_signal_exit")
     save_state(open_shorts, daily_trade_tracker)
     send_telegram_message(
@@ -2694,6 +2720,7 @@ def close_position_manual(symbol, open_shorts, daily_trade_tracker):
     else:
         daily_trade_tracker["losses"] += 1
     record_loss_cooldown(symbol, pnl, daily_trade_tracker, int(time.time() * 1000))
+    record_recent_close(symbol, daily_trade_tracker, int(time.time() * 1000))
     record_trade_close(symbol, pos, pnl, "manual_telegram")
     save_state(open_shorts, daily_trade_tracker)
 
@@ -4307,8 +4334,12 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
     regardless of which resting order filled it.
 
     Same as strategy 4: exempt from the shared ENTRY_COOLDOWN_HOURS/
-    LOSS_COOLDOWN_HOURS re-entry cooldowns and the MAX_TRADES_PER_DAY cap —
-    the only real gate per-symbol is already having an open position on that
+    LOSS_COOLDOWN_HOURS re-entry cooldowns and the MAX_TRADES_PER_DAY cap.
+    It DOES have its own re-entry cooldown though: STRATEGY5_REENTRY_COOLDOWN_HOURS
+    (default 1h) blocks re-entering a symbol for that many hours from the
+    moment its last position closed, win or loss alike — see
+    daily_trade_tracker["recent_closes"] / record_recent_close(). Otherwise
+    the only gates per-symbol are already having an open position on that
     symbol, or (in live trading) not having enough free wallet balance left
     for the next trade's margin — checked twice: once cheaply against the
     cycle-start snapshot before spending a klines fetch, then again against
@@ -4323,6 +4354,14 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             # resting TP/SL orders, picked up next cycle by
             # reconcile_open_shorts(). Nothing to do here until it's flat
             # again. Move on and check the next symbol in the list.
+            continue
+
+        last_close_ms = daily_trade_tracker.get("recent_closes", {}).get(symbol)
+        if last_close_ms is not None and now_ms - last_close_ms < STRATEGY5_REENTRY_COOLDOWN_MS:
+            remaining_min = (STRATEGY5_REENTRY_COOLDOWN_MS - (now_ms - last_close_ms)) / 60000
+            print(f"  [strategy5] {symbol}: closed {((now_ms - last_close_ms) / 60000):.1f} min ago — "
+                  f"still within the {STRATEGY5_REENTRY_COOLDOWN_HOURS:g}h re-entry cooldown "
+                  f"({remaining_min:.1f} min remaining), skipping this cycle.")
             continue
 
         # Coarse check using the cycle-start balance snapshot, just to avoid
@@ -4792,6 +4831,12 @@ def run_once(instruments, top_cap_symbols, usdt_inr_rate, open_shorts, daily_tra
     daily_trade_tracker["recent_losses"] = {
         s: t for s, t in daily_trade_tracker.get("recent_losses", {}).items() if t >= loss_cooldown_cutoff_ms
     }
+    # Same pruning for strategy 5's own re-entry cooldown (see
+    # record_recent_close() / STRATEGY5_REENTRY_COOLDOWN_HOURS).
+    close_cooldown_cutoff_ms = now_ms - STRATEGY5_REENTRY_COOLDOWN_MS
+    daily_trade_tracker["recent_closes"] = {
+        s: t for s, t in daily_trade_tracker.get("recent_closes", {}).items() if t >= close_cooldown_cutoff_ms
+    }
 
     # Dispatch to whichever strategy is currently active. Positions already
     # open from the OTHER strategy are unaffected either way — they keep
@@ -4876,6 +4921,9 @@ def main():
         "recent_losses": {},      # symbol -> closed_at_ms of its most recent LOSING close, used for the
                                    # longer no-re-entry cooldown (LOSS_COOLDOWN_HOURS). Same rolling-window
                                    # behavior as recent_entries — survives the midnight-IST rollover.
+        "recent_closes": {},      # symbol -> closed_at_ms of its most recent close (ANY reason, win or
+                                   # loss), used only by strategy 5's own STRATEGY5_REENTRY_COOLDOWN_HOURS
+                                   # gate. Same rolling-window behavior as recent_entries/recent_losses.
     }  # resets at midnight IST; a summary is sent to Telegram right before the reset.
        # May be overwritten below by recover_open_positions() if a same-day
        # saved state file exists (restores counters across a restart).
