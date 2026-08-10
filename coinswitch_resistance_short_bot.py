@@ -4481,6 +4481,42 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         available_balance_usdt -= order_margin_usdt * (filled_qty / qty)
         qty = filled_qty
 
+        # Track and save IMMEDIATELY on fill confirmation, BEFORE attempting
+        # TP/SL — not after, like before. Reason: sys.exit(0) inside
+        # _handle_shutdown_signal() (fired on SIGTERM, e.g. a Railway
+        # redeploy — very possible mid-cycle, including right now while
+        # deploying earlier fixes) raises SystemExit, which is a
+        # BaseException, NOT an Exception — every try/except Exception guard
+        # added above (entry order, TP, SL) does NOT catch it. If that signal
+        # lands anywhere between the fill confirming and the old tracking
+        # code at the bottom of this function, the position — already real
+        # and live on the exchange, possibly with a real TP already resting
+        # too — was lost entirely: untracked, no /status entry, nothing in
+        # Telegram. Seen live on an EIGENUSDT long. Saving the position here,
+        # BEFORE either order-placement network call below, shrinks that
+        # unsafe window down to a few lines of pure in-memory dict work with
+        # no network I/O in between — about as close to zero as this can get
+        # without a much bigger redesign. TP/SL details get filled in and
+        # re-saved below once/if those calls succeed.
+        with state_lock:
+            open_shorts[symbol] = {
+                "entry_price": entry_price,
+                "qty": qty,
+                "tp_price": None,
+                "tp_order_id": None,
+                "sl_price": None,
+                "sl_order_id": None,
+                "price_precision": price_precision,
+                "opened_at_ms": opened_at_ms,
+                "simulated": DRY_RUN,
+                "leverage": leverage,
+                "liquidation_warning_sent": False,
+                "side": side,
+                "strategy": "5",
+            }
+            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
+            save_state(open_shorts, daily_trade_tracker)
+
         # Take-profit AND stop-loss are both flat STRATEGY5_TP_PCT/STRATEGY5_SL_PCT
         # price moves off entry (not %-of-capital figures) — direction-aware,
         # same shape as strategy 4's TP but with a symmetric SL added, matching
@@ -4502,17 +4538,12 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             tp_order_id = tp_resp["data"].get("order_id")
             print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): "
                   f"{tp_resp['data']}")
+            with state_lock:
+                if symbol in open_shorts:  # still there unless closed/edited in the meantime
+                    open_shorts[symbol]["tp_price"] = tp_price
+                    open_shorts[symbol]["tp_order_id"] = tp_order_id
+                    save_state(open_shorts, daily_trade_tracker)
         except Exception as e:
-            # CRITICAL: must not let this propagate. Before this fix, a failed
-            # TP placement here raised straight out of enter_trades_strategy5()
-            # and skipped everything below it — SL placement, the Telegram
-            # entry message, AND open_shorts[symbol]=... / save_state(). The
-            # market entry order had already filled on the exchange by this
-            # point, so the result was a real, live position the bot never
-            # tracked at all: invisible to /status, no resting TP or SL,
-            # nothing in Telegram — seen live on an EIGENUSDT long. Same
-            # "don't abort the whole entry" handling the SL placement below
-            # already had; now both sides get it.
             tp_order_id = None
             tp_price = None
             print(f"      [strategy5] {symbol}: failed to place take-profit order ({e}) — "
@@ -4531,11 +4562,16 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                 sl_order_id = sl_resp["data"].get("order_id")
                 print(f"      [strategy5] stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}% price move): "
                       f"{sl_resp['data']}")
+                with state_lock:
+                    if symbol in open_shorts:
+                        open_shorts[symbol]["sl_price"] = sl_price
+                        open_shorts[symbol]["sl_order_id"] = sl_order_id
+                        save_state(open_shorts, daily_trade_tracker)
             except Exception as e:
                 # Don't abort the whole entry over a failed SL placement — the
-                # position is already open with a real take-profit resting.
-                # Flag it loudly instead so it doesn't silently run without a
-                # stop-loss.
+                # position is already open (and already tracked) with a real
+                # take-profit resting. Flag it loudly instead so it doesn't
+                # silently run without a stop-loss.
                 print(f"      [strategy5] {symbol}: failed to place stop-loss order ({e}) — "
                       f"position will run with take-profit only until you set one manually via /sl.")
                 send_telegram_message(
@@ -4555,27 +4591,6 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             + "\nCloses on WHICHEVER of TP/SL hits first — no signal-reversal exit for this strategy."
         )
         send_telegram_message(entry_msg)
-
-        with state_lock:
-            open_shorts[symbol] = {
-                "entry_price": entry_price,
-                "qty": qty,
-                "tp_price": tp_price,
-                "tp_order_id": tp_order_id,
-                "sl_price": sl_price,
-                "sl_order_id": sl_order_id,
-                "price_precision": price_precision,
-                "opened_at_ms": opened_at_ms,
-                "simulated": DRY_RUN,
-                "leverage": leverage,
-                "liquidation_warning_sent": False,
-                "side": side,
-                "strategy": "5",
-            }
-            # Recorded for visibility in /cooldowns etc., even though strategy 5's
-            # own entry logic above never checks it — same exemption as strategy 4.
-            daily_trade_tracker["recent_entries"][symbol] = opened_at_ms
-            save_state(open_shorts, daily_trade_tracker)
 
     return available_balance_usdt
 
