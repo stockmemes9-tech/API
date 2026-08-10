@@ -4728,35 +4728,46 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         tp_pct = STRATEGY5_TP_PCT / 100
         sl_pct = STRATEGY5_SL_PCT / 100
         if side == "LONG":
-            tp_price = round(entry_price * (1 + tp_pct), price_precision)
+            tp_price = round(entry_price * (1 + tp_pct), price_precision) if STRATEGY5_TP_PCT > 0 else None
             sl_price = round(entry_price * (1 - sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
             close_side = "SELL"
         else:
-            tp_price = round(entry_price * (1 - tp_pct), price_precision)
+            tp_price = round(entry_price * (1 - tp_pct), price_precision) if STRATEGY5_TP_PCT > 0 else None
             sl_price = round(entry_price * (1 + sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
             close_side = "BUY"
 
-        try:
-            tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
-                                   quantity=qty, price=tp_price, reduce_only=True)
-            tp_order_id = tp_resp["data"].get("order_id")
-            print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): "
-                  f"{tp_resp['data']}")
-            with state_lock:
-                if symbol in open_shorts:  # still there unless closed/edited in the meantime
-                    open_shorts[symbol]["tp_price"] = tp_price
-                    open_shorts[symbol]["tp_order_id"] = tp_order_id
-                    save_state(open_shorts, daily_trade_tracker)
-        except Exception as e:
-            tp_order_id = None
-            tp_price = None
-            print(f"      [strategy5] {symbol}: failed to place take-profit order ({e}) — "
-                  f"position will run with no take-profit until you set one manually via /tp or /tppct.")
-            send_telegram_message(
-                f"⚠️ [Strategy 5] {symbol} take-profit order failed to place: {e}. "
-                f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
-                f"/tppct {symbol} PERCENT to set one manually."
-            )
+        tp_order_id = None
+        if tp_price is not None:
+            # BUG FIX: this used to run unconditionally regardless of
+            # STRATEGY5_TP_PCT, unlike the SL branch below which already
+            # guards on STRATEGY5_SL_PCT > 0. If STRATEGY5_TP_PCT were ever
+            # set to 0 (meaning "no take-profit", same convention as SL=0),
+            # tp_price computed to exactly entry_price, and a reduce_only
+            # LIMIT order placed AT the entry price would likely fill
+            # almost immediately — closing the position right after opening
+            # it, the opposite of "no take-profit". Now mirrors the SL
+            # guard: STRATEGY5_TP_PCT <= 0 skips TP placement entirely.
+            try:
+                tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
+                                       quantity=qty, price=tp_price, reduce_only=True)
+                tp_order_id = tp_resp["data"].get("order_id")
+                print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): "
+                      f"{tp_resp['data']}")
+                with state_lock:
+                    if symbol in open_shorts:  # still there unless closed/edited in the meantime
+                        open_shorts[symbol]["tp_price"] = tp_price
+                        open_shorts[symbol]["tp_order_id"] = tp_order_id
+                        save_state(open_shorts, daily_trade_tracker)
+            except Exception as e:
+                tp_order_id = None
+                tp_price = None
+                print(f"      [strategy5] {symbol}: failed to place take-profit order ({e}) — "
+                      f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+                send_telegram_message(
+                    f"⚠️ [Strategy 5] {symbol} take-profit order failed to place: {e}. "
+                    f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+                    f"/tppct {symbol} PERCENT to set one manually."
+                )
 
         sl_order_id = None
         if sl_price is not None:
@@ -4772,10 +4783,20 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                         open_shorts[symbol]["sl_order_id"] = sl_order_id
                         save_state(open_shorts, daily_trade_tracker)
             except Exception as e:
-                # Don't abort the whole entry over a failed SL placement — the
-                # position is already open (and already tracked) with a real
-                # take-profit resting. Flag it loudly instead so it doesn't
-                # silently run without a stop-loss.
+                # BUG FIX: this used to leave sl_price at its already-computed
+                # value on failure, unlike the TP branch (which correctly
+                # resets tp_price = None on failure). The real tracked
+                # open_shorts[symbol]["sl_price"] was never wrong — it's only
+                # written on success, a few lines up — but entry_msg below
+                # reads this same local `sl_price` variable, so without this
+                # reset it would falsely tell you "Stop-loss @ {price}" even
+                # though the order never actually got placed. Don't abort the
+                # whole entry over a failed SL placement — the position is
+                # already open (and already tracked) with a real take-profit
+                # resting. Flag it loudly instead so it doesn't silently run
+                # without a stop-loss, and don't lie about it having one.
+                sl_order_id = None
+                sl_price = None
                 print(f"      [strategy5] {symbol}: failed to place stop-loss order ({e}) — "
                       f"position will run with take-profit only until you set one manually via /sl.")
                 send_telegram_message(
