@@ -3678,6 +3678,11 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         if filled_qty <= 0:
             print(f"      {symbol}: order response reports 0 filled quantity, skipping "
                   f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            send_telegram_message(
+                f"⚠️ [Strategy 1] {symbol}: entry order response reported 0 filled quantity. "
+                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
+                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
+            )
             continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
@@ -3862,6 +3867,11 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
         if filled_qty <= 0:
             print(f"      {symbol}: order response reports 0 filled quantity, skipping "
                   f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            send_telegram_message(
+                f"⚠️ [Strategy 2] {symbol}: entry order response reported 0 filled quantity. "
+                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
+                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
+            )
             continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
@@ -4046,6 +4056,11 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
         if filled_qty <= 0:
             print(f"      {symbol}: order response reports 0 filled quantity, skipping "
                   f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+            send_telegram_message(
+                f"⚠️ [Strategy 3] {symbol}: entry order response reported 0 filled quantity. "
+                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
+                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
+            )
             continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
@@ -4225,6 +4240,11 @@ def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
     if filled_qty <= 0:
         print(f"      [strategy4] {symbol}: order response reports 0 filled quantity, skipping "
               f"take-profit placement and not tracking a position. Raw: {resp['data']}")
+        send_telegram_message(
+            f"⚠️ [Strategy 4] {symbol}: entry order response reported 0 filled quantity. "
+            f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
+            f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
+        )
         return available_balance_usdt
     if filled_qty != qty:
         print(f"      [strategy4] {symbol}: requested {qty}, filled {filled_qty} "
@@ -4513,6 +4533,11 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         if filled_qty <= 0:
             print(f"      [strategy5] {symbol}: order response reports 0 filled quantity, skipping "
                   f"TP/SL placement and not tracking a position. Raw: {resp['data']}")
+            send_telegram_message(
+                f"⚠️ [Strategy 5] {symbol}: entry order response reported 0 filled quantity. "
+                f"The bot is NOT tracking this and has NOT placed TP/SL. If it actually filled on "
+                f"CoinSwitch (check the app), it is currently unprotected — please verify manually."
+            )
             continue
         if filled_qty != qty:
             print(f"      [strategy5] {symbol}: requested {qty}, filled {filled_qty} "
