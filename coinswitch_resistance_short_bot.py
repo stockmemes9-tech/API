@@ -431,7 +431,7 @@ STRATEGY5_ENABLED = True
 # comma-separated). STRATEGY5_SYMBOL (singular) is kept as a
 # backward-compatible override for a single-symbol deploy — if it's set and
 # STRATEGY5_SYMBOLS isn't, it's used instead of the default list.
-_STRATEGY5_SYMBOLS_DEFAULT = "CCUSDT,DEEPUSDT,CRVUSDT,ARBUSDT,PLUMEUSDT,AEROUSDT,ARXUSDT,EIGENUSDT"
+_STRATEGY5_SYMBOLS_DEFAULT = "CCUSDT,DEEPUSDT,CRVUSDT,ARBUSDT,PLUMEUSDT,AEROUSDT,ARXUSDT,EIGENUSDT,REZUSDT,ADXUSDT,DGBUSDT,OPNUSDT"
 STRATEGY5_SYMBOLS = [
     s.strip().upper()
     for s in os.environ.get(
