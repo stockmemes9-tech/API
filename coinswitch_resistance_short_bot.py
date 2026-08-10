@@ -4397,10 +4397,32 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             sl_price = round(entry_price * (1 + sl_pct), price_precision) if STRATEGY5_SL_PCT > 0 else None
             close_side = "BUY"
 
-        tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
-                               quantity=qty, price=tp_price, reduce_only=True)
-        tp_order_id = tp_resp["data"].get("order_id")
-        print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): {tp_resp['data']}")
+        try:
+            tp_resp = place_order(symbol, side=close_side, order_type="LIMIT",
+                                   quantity=qty, price=tp_price, reduce_only=True)
+            tp_order_id = tp_resp["data"].get("order_id")
+            print(f"      [strategy5] take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}% price move): "
+                  f"{tp_resp['data']}")
+        except Exception as e:
+            # CRITICAL: must not let this propagate. Before this fix, a failed
+            # TP placement here raised straight out of enter_trades_strategy5()
+            # and skipped everything below it — SL placement, the Telegram
+            # entry message, AND open_shorts[symbol]=... / save_state(). The
+            # market entry order had already filled on the exchange by this
+            # point, so the result was a real, live position the bot never
+            # tracked at all: invisible to /status, no resting TP or SL,
+            # nothing in Telegram — seen live on an EIGENUSDT long. Same
+            # "don't abort the whole entry" handling the SL placement below
+            # already had; now both sides get it.
+            tp_order_id = None
+            tp_price = None
+            print(f"      [strategy5] {symbol}: failed to place take-profit order ({e}) — "
+                  f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+            send_telegram_message(
+                f"⚠️ [Strategy 5] {symbol} take-profit order failed to place: {e}. "
+                f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+                f"/tppct {symbol} PERCENT to set one manually."
+            )
 
         sl_order_id = None
         if sl_price is not None:
@@ -4429,7 +4451,7 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
             f"{f' (symbol minimum forced leverage UP from {STRATEGY5_LEVERAGE}x)' if leverage > STRATEGY5_LEVERAGE else ''}\n"
             f"Signal: EMA{STRATEGY5_EMA_FAST}/EMA{STRATEGY5_EMA_SLOW} crossover on "
             f"{STRATEGY5_KLINE_INTERVAL}m candles, confirmed by close\n"
-            f"Take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}%)"
+            f"{'No take-profit set' if tp_price is None else f'Take-profit @ {tp_price} ({STRATEGY5_TP_PCT:g}%)'}"
             + (f"  |  Stop-loss @ {sl_price} ({STRATEGY5_SL_PCT:g}%)" if sl_price is not None else "  |  No stop-loss set")
             + "\nCloses on WHICHEVER of TP/SL hits first — no signal-reversal exit for this strategy."
         )
