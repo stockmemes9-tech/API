@@ -1763,7 +1763,7 @@ def set_leverage(symbol, leverage):
     already in open_shorts."""
     if DRY_RUN:
         print(f"    [DRY RUN] would set leverage to {leverage}x on {symbol}")
-        return
+        return {"data": {"leverage": leverage}}
     headers, path = sign_request("POST", "/trade/api/v2/futures/leverage")
     body = {"symbol": symbol, "exchange": EXCHANGE, "leverage": leverage}
     r = requests.post(BASE_URL + path, headers=headers, json=body, timeout=15)
@@ -4565,17 +4565,63 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
                   f"above {STRATEGY5_LEVERAGE}x — trading at {leverage}x instead, which is MORE "
                   f"leverage than desired.")
         try:
-            set_leverage(symbol, leverage)
+            leverage_resp = set_leverage(symbol, leverage)
         except Exception as e:
             # If the exchange rejects/ignores this, the account may still be
             # sitting at whatever leverage it had before — which can silently
             # break the margin math below (notional / intended leverage) if
-            # the real effective leverage ends up lower. Log it loudly and
-            # keep going rather than abort the whole cycle; the sizing log
-            # line right below will show whether that's what happened.
+            # the real effective leverage ends up lower. This is exactly the
+            # class of failure that caused a live "Insufficient balance"
+            # rejection on MMTUSDT despite a healthy free-balance snapshot,
+            # so treat it as unsafe to size an order against and skip this
+            # symbol for the cycle rather than guessing.
             print(f"      [strategy5] {symbol}: set_leverage({leverage}x) failed ({e}) — "
                   f"the exchange may still be using a different leverage than intended, which can "
-                  f"cause an 'Insufficient balance' rejection even with a healthy free balance.")
+                  f"cause an 'Insufficient balance' rejection even with a healthy free balance. "
+                  f"Skipping this trade this cycle rather than sizing against an unconfirmed leverage.")
+            continue
+
+        # Confirm the exchange actually applied the requested leverage before
+        # sizing the order off it. set_leverage()'s HTTP 200 only means the
+        # request was accepted, not that the account is now at `leverage`x —
+        # this is the same MMTUSDT-style failure mode as above, just via a
+        # response that "succeeds" while silently not taking effect. Pull the
+        # confirmed value out of whatever shape the response comes back in
+        # and bail on a mismatch instead of sizing against a leverage that
+        # isn't actually in effect (order_margin_usdt * leverage below would
+        # then understate the real notional / overstate the real margin).
+        confirmed_leverage = None
+        if isinstance(leverage_resp, dict):
+            lev_data = leverage_resp.get("data", leverage_resp)
+            if isinstance(lev_data, dict):
+                for key in ("leverage", "current_leverage", "applied_leverage"):
+                    if key in lev_data:
+                        confirmed_leverage = lev_data[key]
+                        break
+        if confirmed_leverage is not None:
+            try:
+                confirmed_leverage = float(confirmed_leverage)
+            except (TypeError, ValueError):
+                confirmed_leverage = None
+
+        if confirmed_leverage is None:
+            # Response didn't echo a leverage field we recognize — can't
+            # confirm either way. Log it loudly (so the raw shape is
+            # diagnosable) and proceed on the assumption the request took,
+            # same as prior behavior, rather than blocking every trade over
+            # an unfamiliar response format.
+            print(f"      [strategy5] {symbol}: set_leverage({leverage}x) response didn't include a "
+                  f"recognizable leverage confirmation field (raw: {leverage_resp}) — proceeding "
+                  f"unconfirmed.")
+        elif confirmed_leverage != leverage:
+            print(f"      [strategy5] {symbol}: requested {leverage}x but CoinSwitch confirmed "
+                  f"{confirmed_leverage:g}x instead — margin math below would be wrong at the "
+                  f"requested leverage, so skipping this trade this cycle instead of risking an "
+                  f"under-margined / rejected order.")
+            continue
+        else:
+            print(f"      [strategy5] {symbol}: leverage confirmed at {confirmed_leverage:g}x.")
+            leverage = confirmed_leverage
 
         # Re-fetch the wallet balance right here, immediately before placing
         # the order — the cycle-start snapshot (available_balance_usdt) can
