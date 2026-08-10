@@ -633,10 +633,35 @@ TRADE_HISTORY_FILE_PATH = os.environ.get("TRADE_HISTORY_FILE_PATH", "trade_histo
 # From CoinSwitch's official Reference Client docs.
 def sign_request(method, path, params=None):
     method = method.upper()
+    encoded_path = path
     if params:
         sep = "&" if "?" in path else "?"
-        path = path + sep + urllib.parse.urlencode(params)
-    decoded_path = urllib.parse.unquote_plus(path)
+        encoded_path = path + sep + urllib.parse.urlencode(params)
+    # CORE BUG FIX: this used to unquote_plus() the encoded path and then
+    # return THAT (decoded) path as the actual request URL too — which
+    # silently undid urlencode()'s escaping before the request ever hit the
+    # network. Harmless for params with no reserved characters (symbols,
+    # timestamps, etc — the vast majority of calls), but for any param
+    # value containing '&', '=', '#', '%', or a space, it corrupted the
+    # query string. Concretely: get_realized_pnl()'s "type": "P&L" param
+    # encodes correctly to "type=P%26L", then got unquote_plus()'d back to
+    # the literal "type=P&L" — which the server parses as type=P + a bare
+    # "L" token, not "type=P&L", producing a 400 Bad Request on every
+    # single call. That silent failure was masking the bot's own trading
+    # fees: get_realized_pnl() always fell back to a price-only estimate
+    # (which explicitly excludes fees — see the "(fees excluded)" log
+    # line), so every P&L shown in Telegram/status was missing entry/exit
+    # fees, making the wallet balance drift lower than reported gains would
+    # suggest.
+    #
+    # decoded_path is still computed and still used for the SIGNATURE
+    # message below (unchanged behavior — every currently-working endpoint
+    # keeps signing over the exact same decoded string it always has,
+    # since none of their param values contain reserved characters, decoded
+    # and encoded forms are identical for them). Only the path actually
+    # sent to the network changes, from the corrupted decoded_path to the
+    # correct encoded_path.
+    decoded_path = urllib.parse.unquote_plus(encoded_path)
 
     epoch = str(int(time.time() * 1000))
     message = method + decoded_path + epoch
@@ -650,7 +675,7 @@ def sign_request(method, path, params=None):
         "X-AUTH-SIGNATURE": signature,
         "X-AUTH-EPOCH": epoch,
     }
-    return headers, decoded_path
+    return headers, encoded_path
 
 
 # ------------------------------ Telegram --------------------------------------
