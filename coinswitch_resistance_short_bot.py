@@ -3680,15 +3680,34 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         tp_order_id = None
         if TP_CAPITAL_PCT > 0:
             tp_price = round(cand["last_price"] * (1 + tp_price_pct / 100), price_precision)
-            tp_resp = place_order(symbol, side="SELL", order_type="LIMIT",
-                                   quantity=qty, price=tp_price, reduce_only=True)
-            tp_order_id = tp_resp["data"].get("order_id")
-            print(f"      take-profit @ {tp_price} "
-                  f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
-            send_telegram_message(
-                f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
-                f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital)"
-            )
+            try:
+                tp_resp = place_order(symbol, side="SELL", order_type="LIMIT",
+                                       quantity=qty, price=tp_price, reduce_only=True)
+                tp_order_id = tp_resp["data"].get("order_id")
+                print(f"      take-profit @ {tp_price} "
+                      f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
+                send_telegram_message(
+                    f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
+                    f"({tp_price_pct:.2f}% price move -> {TP_CAPITAL_PCT:.1f}% on capital)"
+                )
+            except Exception as e:
+                # CRITICAL: must not propagate. Before this fix, a failed TP
+                # placement here raised straight out of the function and
+                # skipped open_shorts[symbol]=... / save_state() below — the
+                # market entry order had already filled on the exchange, so
+                # the result was a real, live, completely untracked position
+                # (invisible to /status, no resting TP anywhere), even though
+                # the entry_msg above had already been sent to Telegram. Same
+                # class of bug fixed in strategy 5's enter_trades_strategy5().
+                tp_price = cand["last_price"]
+                tp_order_id = None
+                print(f"      {symbol}: failed to place take-profit order ({e}) — "
+                      f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+                send_telegram_message(
+                    f"⚠️ [Strategy 1] {symbol} take-profit order failed to place: {e}. "
+                    f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+                    f"/tppct {symbol} PERCENT to set one manually."
+                )
 
         with state_lock:
             open_shorts[symbol] = {
@@ -3850,15 +3869,32 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
             else:
                 tp_price = round(cand["last_price"] * (1 + tp_price_pct / 100), price_precision)
                 tp_close_side = "SELL"
-            tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
-                                   quantity=qty, price=tp_price, reduce_only=True)
-            tp_order_id = tp_resp["data"].get("order_id")
-            print(f"      take-profit @ {tp_price} "
-                  f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
-            send_telegram_message(
-                f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
-                f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital)"
-            )
+            try:
+                tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
+                                       quantity=qty, price=tp_price, reduce_only=True)
+                tp_order_id = tp_resp["data"].get("order_id")
+                print(f"      take-profit @ {tp_price} "
+                      f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
+                send_telegram_message(
+                    f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
+                    f"({tp_price_pct:.2f}% price move -> {STRATEGY2_TP_CAPITAL_PCT:.1f}% on capital)"
+                )
+            except Exception as e:
+                # CRITICAL: must not propagate — same class of bug fixed in
+                # strategy 5's enter_trades_strategy5(). A failed TP here
+                # used to raise straight out of the function and skip
+                # open_shorts[symbol]=.../save_state() below, leaving a
+                # real, live, completely untracked position even though the
+                # entry_msg had already gone to Telegram.
+                tp_price = cand["last_price"]
+                tp_order_id = None
+                print(f"      {symbol}: failed to place take-profit order ({e}) — "
+                      f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+                send_telegram_message(
+                    f"⚠️ [Strategy 2] {symbol} take-profit order failed to place: {e}. "
+                    f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+                    f"/tppct {symbol} PERCENT to set one manually."
+                )
 
         with state_lock:
             open_shorts[symbol] = {
@@ -4010,15 +4046,28 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
         tp_order_id = None
         if STRATEGY3_TP_CAPITAL_PCT > 0:
             tp_price = round(cand["last_price"] * (1 - tp_price_pct / 100), price_precision)
-            tp_resp = place_order(symbol, side="BUY", order_type="LIMIT",
-                                   quantity=qty, price=tp_price, reduce_only=True)
-            tp_order_id = tp_resp["data"].get("order_id")
-            print(f"      take-profit @ {tp_price} "
-                  f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
-            send_telegram_message(
-                f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
-                f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital)"
-            )
+            try:
+                tp_resp = place_order(symbol, side="BUY", order_type="LIMIT",
+                                       quantity=qty, price=tp_price, reduce_only=True)
+                tp_order_id = tp_resp["data"].get("order_id")
+                print(f"      take-profit @ {tp_price} "
+                      f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital): {tp_resp['data']}")
+                send_telegram_message(
+                    f"{'[DRY RUN] ' if DRY_RUN else ''}Take-profit set for {symbol} @ {tp_price} "
+                    f"({tp_price_pct:.2f}% price move -> {STRATEGY3_TP_CAPITAL_PCT:.1f}% on capital)"
+                )
+            except Exception as e:
+                # CRITICAL: must not propagate — same class of bug fixed in
+                # strategy 5's enter_trades_strategy5().
+                tp_price = cand["last_price"]
+                tp_order_id = None
+                print(f"      {symbol}: failed to place take-profit order ({e}) — "
+                      f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+                send_telegram_message(
+                    f"⚠️ [Strategy 3] {symbol} take-profit order failed to place: {e}. "
+                    f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+                    f"/tppct {symbol} PERCENT to set one manually."
+                )
 
         with state_lock:
             open_shorts[symbol] = {
@@ -4167,11 +4216,29 @@ def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
         tp_price = round(entry_price * (1 - tp_pct), price_precision)
         tp_close_side = "BUY"
 
-    tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
-                           quantity=qty, price=tp_price, reduce_only=True)
-    tp_order_id = tp_resp["data"].get("order_id")
-    print(f"      [strategy4] take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price "
-          f"move): {tp_resp['data']}")
+    tp_resp = None
+    tp_order_id = None
+    try:
+        tp_resp = place_order(symbol, side=tp_close_side, order_type="LIMIT",
+                               quantity=qty, price=tp_price, reduce_only=True)
+        tp_order_id = tp_resp["data"].get("order_id")
+        print(f"      [strategy4] take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price "
+              f"move): {tp_resp['data']}")
+    except Exception as e:
+        # CRITICAL: must not propagate — same class of bug fixed in
+        # strategy 5's enter_trades_strategy5(). A failed TP here used to
+        # raise straight out of the function and skip open_shorts[symbol]=
+        # .../save_state() AND the entry_msg below, leaving a real, live,
+        # completely untracked position.
+        tp_price = None
+        tp_order_id = None
+        print(f"      [strategy4] {symbol}: failed to place take-profit order ({e}) — "
+              f"position will run with no take-profit until you set one manually via /tp or /tppct.")
+        send_telegram_message(
+            f"⚠️ [Strategy 4] {symbol} take-profit order failed to place: {e}. "
+            f"Position is open with NO take-profit — use /tp {symbol} PRICE or "
+            f"/tppct {symbol} PERCENT to set one manually."
+        )
 
     entry_msg = (
         f"{'[DRY RUN] ' if DRY_RUN else ''}[Strategy 4] {side} {symbol}\n"
@@ -4180,9 +4247,11 @@ def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
         f"{f' (symbol minimum forced leverage UP from {STRATEGY4_LEVERAGE}x)' if leverage > STRATEGY4_LEVERAGE else ''}\n"
         f"Signal: 15m candle closed {'above' if side == 'LONG' else 'below'} EMA9 "
         f"({latest_close:.6g} vs {latest_ema:.6g})\n"
-        f"Take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price move) — OR closes early "
-        f"if a later 15m candle closes back across EMA9 against this position.\n"
-        f"No stop-loss set. Use /sl {symbol} PRICE to set one."
+        + (f"Take-profit @ {tp_price} ({STRATEGY4_TP_PRICE_MOVE_PCT:g}% price move) — OR closes early "
+           f"if a later 15m candle closes back across EMA9 against this position.\n"
+           if tp_price is not None else
+           "No take-profit set (order failed) — closes on a later 15m candle closing back across EMA9.\n")
+        + "No stop-loss set. Use /sl " + symbol + " PRICE to set one."
     )
     send_telegram_message(entry_msg)
 
@@ -4361,10 +4430,40 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         qty = compute_quantity(entry_price, order_margin_usdt, leverage, instrument)
 
         entry_side = "BUY" if side == "LONG" else "SELL"
-        resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
-        opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP/SL orders below
-        print(f"      [strategy5] order response: {resp['data']}")
+        try:
+            resp = place_order(symbol, side=entry_side, order_type="MARKET", quantity=qty)
+            opened_at_ms = int(time.time() * 1000)  # captured right at entry, not after the TP/SL orders below
+            print(f"      [strategy5] order response: {resp['data']}")
+        except Exception as e:
+            # This is the last unguarded gap in this function — and the most
+            # dangerous one, because a MARKET order can genuinely execute on
+            # CoinSwitch's side even when the HTTP response never makes it
+            # back here (timeout, dropped connection, etc), or come back 200
+            # with an unexpected shape (missing 'data', caught here too since
+            # resp['data'] is now inside this same try). Before this fix,
+            # either case propagated straight out of enter_trades_strategy5()
+            # and skipped EVERYTHING: no TP/SL, no open_shorts tracking, no
+            # Telegram message of any kind — a trade that shows up in the
+            # CoinSwitch app but leaves absolutely no trace here. We
+            # genuinely can't tell from this exception alone whether the
+            # order filled, so rather than guess (and either fabricate a
+            # phantom tracked position or silently drop a real one), alert
+            # loudly and tell you to check manually — this is the one case
+            # where "don't abort" isn't safe, because we don't have a fill
+            # confirmation to safely build a tracked position from.
+            print(f"  [strategy5] {symbol}: entry order request failed/errored ({e}) — "
+                  f"UNKNOWN whether it actually filled on the exchange.")
+            send_telegram_message(
+                f"⚠️ [Strategy 5] {symbol} entry order request failed/errored: {e}\n"
+                f"This may or may not have actually filled on CoinSwitch — please check the app "
+                f"manually. If it filled, it is NOT yet tracked by the bot (no TP/SL set); it will "
+                f"be picked up automatically on the next restart, or set TP/SL now with /tp, /sl, "
+                f"/tppct, or /slpct once you confirm it in the app."
+            )
+            continue
         daily_trade_tracker["count"] += 1
+
+
 
         # Same partial-fill handling as strategies 1-4 — size everything
         # downstream off what actually filled, not what was requested.
