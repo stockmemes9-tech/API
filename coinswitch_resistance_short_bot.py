@@ -922,6 +922,55 @@ def get_positions(symbol, max_retries=3, retry_delay_seconds=2.0):
         return filtered
 
 
+def confirm_fill_via_positions(symbol, max_attempts=4, delay_seconds=2.0):
+    """CORE FIX for the "0 filled quantity" bug: place_order()'s own response
+    for a MARKET order can report status='RAISED' / exec_quantity='0' even
+    though the order goes on to fill on the exchange a moment later — the
+    response is captured before CoinSwitch's matching engine has actually
+    processed it, not after. Treating that snapshot as final was the root
+    cause of a live TREEUSDT entry (2026-08-10) that filled and was visible
+    in the CoinSwitch app, while the bot concluded it hadn't filled, never
+    tracked it, and never placed a TP/SL — leaving a real, unprotected
+    position invisible to /status and everything else.
+
+    This polls the authoritative source of truth (GET /futures/positions,
+    via get_positions()) a few times with a short delay, instead of trusting
+    the immediate order-response snapshot. If a real position for `symbol`
+    shows up with nonzero size, the order DID fill — return that quantity.
+    If nothing shows up after all attempts, it genuinely didn't fill.
+
+    Returns the filled quantity (float, always positive) if a position is
+    found, else None. Never raises: a get_positions() error on one attempt
+    just costs that attempt, it doesn't abort the whole poll."""
+    for attempt in range(max_attempts):
+        time.sleep(delay_seconds)
+        try:
+            positions = get_positions(symbol)
+        except Exception as e:
+            print(f"      [fill-check] {symbol}: get_positions() failed on attempt "
+                  f"{attempt + 1}/{max_attempts} ({e}), retrying...")
+            continue
+        if positions:
+            p = positions[0]
+            qty = None
+            # Same field-name fallback order as recover_open_positions(),
+            # since this is the same /futures/positions schema.
+            for key in ("position_size", "quantity", "size", "position_amount", "qty"):
+                try:
+                    qty = abs(float(p[key]))
+                    break
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if qty:
+                print(f"      [fill-check] {symbol}: position found on attempt "
+                      f"{attempt + 1}/{max_attempts} with size {qty} — the order DID fill, "
+                      f"despite the immediate order response reporting 0 filled quantity.")
+                return qty
+    print(f"      [fill-check] {symbol}: no open position found after {max_attempts} attempts "
+          f"({max_attempts * delay_seconds:.0f}s total) — order genuinely did not fill.")
+    return None
+
+
 def get_realized_pnl(symbol, from_time_ms):
     """Sums the realized P&L (USDT) recorded for a symbol since from_time_ms.
     Same caveat as get_positions: the exact 'amount' field name is unverified
@@ -3676,14 +3725,19 @@ def enter_trades_strategy1(candidates, instruments, order_margin_usdt, available
         except (TypeError, ValueError):
             filled_qty = qty
         if filled_qty <= 0:
-            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
-                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
-            send_telegram_message(
-                f"⚠️ [Strategy 1] {symbol}: entry order response reported 0 filled quantity. "
-                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
-                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
-            )
-            continue
+            print(f"      {symbol}: order response reports 0 filled quantity — confirming against "
+                  f"live positions before giving up (see confirm_fill_via_positions()). Raw: {resp['data']}")
+            confirmed_qty = confirm_fill_via_positions(symbol)
+            if confirmed_qty:
+                filled_qty = confirmed_qty
+            else:
+                send_telegram_message(
+                    f"⚠️ [Strategy 1] {symbol}: entry order response reported 0 filled quantity, and no "
+                    f"position showed up after checking. The bot is NOT tracking this and has NOT placed "
+                    f"a take-profit. If it actually filled on CoinSwitch (check the app), it is currently "
+                    f"unprotected — please verify manually."
+                )
+                continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
                   f"(partial fill) — sizing take-profit off the filled amount.")
@@ -3865,14 +3919,19 @@ def enter_trades_strategy2(candidates, instruments, order_margin_usdt, available
         except (TypeError, ValueError):
             filled_qty = qty
         if filled_qty <= 0:
-            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
-                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
-            send_telegram_message(
-                f"⚠️ [Strategy 2] {symbol}: entry order response reported 0 filled quantity. "
-                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
-                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
-            )
-            continue
+            print(f"      {symbol}: order response reports 0 filled quantity — confirming against "
+                  f"live positions before giving up (see confirm_fill_via_positions()). Raw: {resp['data']}")
+            confirmed_qty = confirm_fill_via_positions(symbol)
+            if confirmed_qty:
+                filled_qty = confirmed_qty
+            else:
+                send_telegram_message(
+                    f"⚠️ [Strategy 2] {symbol}: entry order response reported 0 filled quantity, and no "
+                    f"position showed up after checking. The bot is NOT tracking this and has NOT placed "
+                    f"a take-profit. If it actually filled on CoinSwitch (check the app), it is currently "
+                    f"unprotected — please verify manually."
+                )
+                continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
                   f"(partial fill) — sizing take-profit off the filled amount.")
@@ -4054,14 +4113,19 @@ def enter_trades_strategy3(candidates, instruments, order_margin_usdt, available
         except (TypeError, ValueError):
             filled_qty = qty
         if filled_qty <= 0:
-            print(f"      {symbol}: order response reports 0 filled quantity, skipping "
-                  f"take-profit placement and not tracking a position. Raw: {resp['data']}")
-            send_telegram_message(
-                f"⚠️ [Strategy 3] {symbol}: entry order response reported 0 filled quantity. "
-                f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
-                f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
-            )
-            continue
+            print(f"      {symbol}: order response reports 0 filled quantity — confirming against "
+                  f"live positions before giving up (see confirm_fill_via_positions()). Raw: {resp['data']}")
+            confirmed_qty = confirm_fill_via_positions(symbol)
+            if confirmed_qty:
+                filled_qty = confirmed_qty
+            else:
+                send_telegram_message(
+                    f"⚠️ [Strategy 3] {symbol}: entry order response reported 0 filled quantity, and no "
+                    f"position showed up after checking. The bot is NOT tracking this and has NOT placed "
+                    f"a take-profit. If it actually filled on CoinSwitch (check the app), it is currently "
+                    f"unprotected — please verify manually."
+                )
+                continue
         if filled_qty != qty:
             print(f"      {symbol}: requested {qty}, filled {filled_qty} "
                   f"(partial fill) — sizing take-profit off the filled amount.")
@@ -4238,14 +4302,19 @@ def enter_trades_strategy4(instruments, usdt_inr_rate, available_balance_usdt,
     except (TypeError, ValueError):
         filled_qty = qty
     if filled_qty <= 0:
-        print(f"      [strategy4] {symbol}: order response reports 0 filled quantity, skipping "
-              f"take-profit placement and not tracking a position. Raw: {resp['data']}")
-        send_telegram_message(
-            f"⚠️ [Strategy 4] {symbol}: entry order response reported 0 filled quantity. "
-            f"The bot is NOT tracking this and has NOT placed a take-profit. If it actually filled "
-            f"on CoinSwitch (check the app), it is currently unprotected — please verify manually."
-        )
-        return available_balance_usdt
+        print(f"      [strategy4] {symbol}: order response reports 0 filled quantity — confirming "
+              f"against live positions before giving up (see confirm_fill_via_positions()). Raw: {resp['data']}")
+        confirmed_qty = confirm_fill_via_positions(symbol)
+        if confirmed_qty:
+            filled_qty = confirmed_qty
+        else:
+            send_telegram_message(
+                f"⚠️ [Strategy 4] {symbol}: entry order response reported 0 filled quantity, and no "
+                f"position showed up after checking. The bot is NOT tracking this and has NOT placed "
+                f"a take-profit. If it actually filled on CoinSwitch (check the app), it is currently "
+                f"unprotected — please verify manually."
+            )
+            return available_balance_usdt
     if filled_qty != qty:
         print(f"      [strategy4] {symbol}: requested {qty}, filled {filled_qty} "
               f"(partial fill) — sizing take-profit off the filled amount.")
@@ -4531,14 +4600,19 @@ def enter_trades_strategy5(instruments, usdt_inr_rate, available_balance_usdt,
         except (TypeError, ValueError):
             filled_qty = qty
         if filled_qty <= 0:
-            print(f"      [strategy5] {symbol}: order response reports 0 filled quantity, skipping "
-                  f"TP/SL placement and not tracking a position. Raw: {resp['data']}")
-            send_telegram_message(
-                f"⚠️ [Strategy 5] {symbol}: entry order response reported 0 filled quantity. "
-                f"The bot is NOT tracking this and has NOT placed TP/SL. If it actually filled on "
-                f"CoinSwitch (check the app), it is currently unprotected — please verify manually."
-            )
-            continue
+            print(f"      [strategy5] {symbol}: order response reports 0 filled quantity — confirming "
+                  f"against live positions before giving up (see confirm_fill_via_positions()). Raw: {resp['data']}")
+            confirmed_qty = confirm_fill_via_positions(symbol)
+            if confirmed_qty:
+                filled_qty = confirmed_qty
+            else:
+                send_telegram_message(
+                    f"⚠️ [Strategy 5] {symbol}: entry order response reported 0 filled quantity, and no "
+                    f"position showed up after checking. The bot is NOT tracking this and has NOT placed "
+                    f"TP/SL. If it actually filled on CoinSwitch (check the app), it is currently "
+                    f"unprotected — please verify manually."
+                )
+                continue
         if filled_qty != qty:
             print(f"      [strategy5] {symbol}: requested {qty}, filled {filled_qty} "
                   f"(partial fill) — sizing TP/SL off the filled amount.")
